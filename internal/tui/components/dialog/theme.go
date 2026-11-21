@@ -1,9 +1,10 @@
 package dialog
 
 import (
-	"github.com/charmbracelet/bubbles/key"
-	tea "github.com/charmbracelet/bubbletea"
-	"github.com/charmbracelet/lipgloss"
+	"charm.land/bubbles/v2/key"
+	tea "charm.land/bubbletea/v2"
+	"charm.land/lipgloss/v2"
+	uv "github.com/charmbracelet/ultraviolet"
 	"github.com/arhammahajan/harness/internal/tui/layout"
 	"github.com/arhammahajan/harness/internal/tui/styles"
 	"github.com/arhammahajan/harness/internal/tui/theme"
@@ -22,6 +23,7 @@ type CloseThemeDialogMsg struct{}
 type ThemeDialog interface {
 	tea.Model
 	layout.Bindings
+	layout.Drawable
 }
 
 type themeDialogCmp struct {
@@ -86,7 +88,7 @@ func (t *themeDialogCmp) Init() tea.Cmd {
 
 func (t *themeDialogCmp) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	switch msg := msg.(type) {
-	case tea.KeyMsg:
+	case tea.KeyPressMsg:
 		switch {
 		case key.Matches(msg, themeKeys.Up) || key.Matches(msg, themeKeys.K):
 			if t.selectedIdx > 0 {
@@ -122,7 +124,7 @@ func (t *themeDialogCmp) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	return t, nil
 }
 
-func (t *themeDialogCmp) View() string {
+func (t *themeDialogCmp) render() string {
 	currentTheme := theme.CurrentTheme()
 	baseStyle := styles.BaseStyle()
 
@@ -143,7 +145,9 @@ func (t *themeDialogCmp) View() string {
 		}
 	}
 
-	maxWidth = max(30, min(maxWidth, t.width-15)) // Limit width to avoid overflow
+	if t.width > 0 {
+		maxWidth = max(30, min(maxWidth, t.width-15)) // Limit width to avoid overflow
+	}
 
 	// Build the theme list
 	themeItems := make([]string, 0, len(t.themes))
@@ -179,8 +183,17 @@ func (t *themeDialogCmp) View() string {
 		Border(lipgloss.RoundedBorder()).
 		BorderBackground(currentTheme.Background()).
 		BorderForeground(currentTheme.TextMuted()).
-		Width(lipgloss.Width(content) + 4).
+		Width(lipgloss.Width(content) + 6).
 		Render(content)
+}
+
+func (t *themeDialogCmp) View() tea.View {
+	return tea.NewView(t.render())
+}
+
+func (t *themeDialogCmp) Draw(scr uv.Screen, area uv.Rectangle) *tea.Cursor {
+	layout.DrawCenter(scr, area, t.render())
+	return nil
 }
 
 func (t *themeDialogCmp) BindingKeys() []key.Binding {
@@ -195,4 +208,3 @@ func NewThemeDialogCmp() ThemeDialog {
 		currentTheme: "",
 	}
 }
-

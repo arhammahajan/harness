@@ -1,16 +1,23 @@
 package layout
 
 import (
-	"github.com/charmbracelet/bubbles/key"
-	tea "github.com/charmbracelet/bubbletea"
-	"github.com/charmbracelet/lipgloss"
-	"github.com/arhammahajan/harness/internal/tui/theme"
+	"image"
+	"image/color"
+
+	"charm.land/bubbles/v2/key"
+	tea "charm.land/bubbletea/v2"
+	"charm.land/lipgloss/v2"
+	uv "github.com/charmbracelet/ultraviolet"
+	uvlayout "github.com/charmbracelet/ultraviolet/layout"
 )
 
+// SplitPaneLayout partitions an area into optional left, right, and bottom
+// panels using Ultraviolet constraint layout rectangles.
 type SplitPaneLayout interface {
 	tea.Model
 	Sizeable
 	Bindings
+	Drawable
 	SetLeftPanel(panel Container) tea.Cmd
 	SetRightPanel(panel Container) tea.Cmd
 	SetBottomPanel(panel Container) tea.Cmd
@@ -29,8 +36,11 @@ type splitPaneLayout struct {
 	rightPanel  Container
 	leftPanel   Container
 	bottomPanel Container
+
+	backgroundFunc func() color.Color
 }
 
+// SplitPaneOption configures a [SplitPaneLayout] created with [NewSplitPane].
 type SplitPaneOption func(*splitPaneLayout)
 
 func (s *splitPaneLayout) Init() tea.Cmd {
@@ -85,85 +95,134 @@ func (s *splitPaneLayout) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	return s, tea.Batch(cmds...)
 }
 
-func (s *splitPaneLayout) View() string {
-	var topSection string
+// computeAreas resolves exact non-overlapping [uv.Rectangle] regions for the
+// left, right, and bottom panels using Ultraviolet's constraint layout solver.
+func (s *splitPaneLayout) computeAreas(area uv.Rectangle) (leftArea, rightArea, bottomArea uv.Rectangle) {
+	if area.Empty() {
+		return
+	}
+
+	hasTop := s.leftPanel != nil || s.rightPanel != nil
+	var topArea uv.Rectangle
+
+	if s.bottomPanel != nil && hasTop {
+		topHeight := int(float64(area.Dy()) * s.verticalRatio)
+		uvlayout.Vertical(
+			uvlayout.Len(topHeight),
+			uvlayout.Fill(1),
+		).Split(area).Assign(&topArea, &bottomArea)
+	} else if s.bottomPanel != nil {
+		bottomArea = area
+		return
+	} else {
+		topArea = area
+	}
 
 	if s.leftPanel != nil && s.rightPanel != nil {
-		leftView := s.leftPanel.View()
-		rightView := s.rightPanel.View()
-		topSection = lipgloss.JoinHorizontal(lipgloss.Top, leftView, rightView)
+		leftWidth := int(float64(topArea.Dx()) * s.ratio)
+		uvlayout.Horizontal(
+			uvlayout.Len(leftWidth),
+			uvlayout.Fill(1),
+		).Split(topArea).Assign(&leftArea, &rightArea)
 	} else if s.leftPanel != nil {
-		topSection = s.leftPanel.View()
+		leftArea = topArea
 	} else if s.rightPanel != nil {
-		topSection = s.rightPanel.View()
-	} else {
-		topSection = ""
+		rightArea = topArea
 	}
 
-	var finalView string
+	return leftArea, rightArea, bottomArea
+}
 
-	if s.bottomPanel != nil && topSection != "" {
-		bottomView := s.bottomPanel.View()
-		finalView = lipgloss.JoinVertical(lipgloss.Left, topSection, bottomView)
-	} else if s.bottomPanel != nil {
-		finalView = s.bottomPanel.View()
-	} else {
-		finalView = topSection
+// Draw renders all configured panels directly into their computed Ultraviolet
+// rectangles on scr and returns the active panel's cursor (preferring a focused
+// panel if one reports a cursor).
+func (s *splitPaneLayout) Draw(scr uv.Screen, area uv.Rectangle) *tea.Cursor {
+	if area.Empty() {
+		return nil
 	}
 
-	if finalView != "" {
-		t := theme.CurrentTheme()
-
-		style := lipgloss.NewStyle().
-			Width(s.width).
-			Height(s.height).
-			Background(t.Background())
-
-		return style.Render(finalView)
+	if area.Dx() != s.width || area.Dy() != s.height {
+		s.SetSize(area.Dx(), area.Dy())
 	}
 
-	return finalView
+	if s.backgroundFunc != nil {
+		if bg := s.backgroundFunc(); bg != nil {
+			bgView := lipgloss.NewStyle().
+				Width(area.Dx()).
+				Height(area.Dy()).
+				Background(bg).
+				Render("")
+			uv.NewStyledString(bgView).Draw(scr, area)
+		}
+	}
+
+	leftArea, rightArea, bottomArea := s.computeAreas(area)
+
+	var (
+		cursor        *tea.Cursor
+		focusedCursor *tea.Cursor
+	)
+	drawPanel := func(panel Container, rect uv.Rectangle) {
+		if panel == nil || rect.Empty() {
+			return
+		}
+		cur := panel.Draw(scr, rect)
+		if cur == nil {
+			return
+		}
+		if f, ok := panel.(interface{ IsFocused() bool }); ok && f.IsFocused() {
+			focusedCursor = cur
+		} else if cursor == nil {
+			cursor = cur
+		}
+	}
+
+	drawPanel(s.leftPanel, leftArea)
+	drawPanel(s.rightPanel, rightArea)
+	drawPanel(s.bottomPanel, bottomArea)
+
+	if focusedCursor != nil {
+		return focusedCursor
+	}
+	return cursor
+}
+
+// View renders the split pane layout into a temporary Ultraviolet screen buffer
+// and returns the resulting [tea.View].
+func (s *splitPaneLayout) View() tea.View {
+	if s.width <= 0 || s.height <= 0 {
+		return tea.NewView("")
+	}
+	buf := uv.NewScreenBuffer(s.width, s.height)
+	cur := s.Draw(buf, buf.Bounds())
+	v := tea.NewView(buf.Render())
+	v.Cursor = cur
+	return v
 }
 
 func (s *splitPaneLayout) SetSize(width, height int) tea.Cmd {
 	s.width = width
 	s.height = height
 
-	var topHeight, bottomHeight int
-	if s.bottomPanel != nil {
-		topHeight = int(float64(height) * s.verticalRatio)
-		bottomHeight = height - topHeight
-	} else {
-		topHeight = height
-		bottomHeight = 0
-	}
-
-	var leftWidth, rightWidth int
-	if s.leftPanel != nil && s.rightPanel != nil {
-		leftWidth = int(float64(width) * s.ratio)
-		rightWidth = width - leftWidth
-	} else if s.leftPanel != nil {
-		leftWidth = width
-		rightWidth = 0
-	} else if s.rightPanel != nil {
-		leftWidth = 0
-		rightWidth = width
-	}
+	leftArea, rightArea, bottomArea := s.computeAreas(image.Rect(0, 0, max(0, width), max(0, height)))
 
 	var cmds []tea.Cmd
 	if s.leftPanel != nil {
-		cmd := s.leftPanel.SetSize(leftWidth, topHeight)
-		cmds = append(cmds, cmd)
+		if cmd := s.leftPanel.SetSize(leftArea.Dx(), leftArea.Dy()); cmd != nil {
+			cmds = append(cmds, cmd)
+		}
 	}
 
 	if s.rightPanel != nil {
-		cmd := s.rightPanel.SetSize(rightWidth, topHeight)
-		cmds = append(cmds, cmd)
+		if cmd := s.rightPanel.SetSize(rightArea.Dx(), rightArea.Dy()); cmd != nil {
+			cmds = append(cmds, cmd)
+		}
 	}
 
 	if s.bottomPanel != nil {
-		cmd := s.bottomPanel.SetSize(width, bottomHeight)
-		cmds = append(cmds, cmd)
+		if cmd := s.bottomPanel.SetSize(bottomArea.Dx(), bottomArea.Dy()); cmd != nil {
+			cmds = append(cmds, cmd)
+		}
 	}
 	return tea.Batch(cmds...)
 }
@@ -223,61 +282,76 @@ func (s *splitPaneLayout) ClearBottomPanel() tea.Cmd {
 func (s *splitPaneLayout) BindingKeys() []key.Binding {
 	keys := []key.Binding{}
 	if s.leftPanel != nil {
-		if b, ok := s.leftPanel.(Bindings); ok {
-			keys = append(keys, b.BindingKeys()...)
-		}
+		keys = append(keys, s.leftPanel.BindingKeys()...)
 	}
 	if s.rightPanel != nil {
-		if b, ok := s.rightPanel.(Bindings); ok {
-			keys = append(keys, b.BindingKeys()...)
-		}
+		keys = append(keys, s.rightPanel.BindingKeys()...)
 	}
 	if s.bottomPanel != nil {
-		if b, ok := s.bottomPanel.(Bindings); ok {
-			keys = append(keys, b.BindingKeys()...)
-		}
+		keys = append(keys, s.bottomPanel.BindingKeys()...)
 	}
 	return keys
 }
 
+// NewSplitPane constructs a [SplitPaneLayout] with default 70/30 horizontal and
+// 90/10 vertical split ratios unless overridden by options.
 func NewSplitPane(options ...SplitPaneOption) SplitPaneLayout {
-
-	layout := &splitPaneLayout{
+	l := &splitPaneLayout{
 		ratio:         0.7,
-		verticalRatio: 0.9, // Default 90% for top section, 10% for bottom
+		verticalRatio: 0.9,
 	}
 	for _, option := range options {
-		option(layout)
+		option(l)
 	}
-	return layout
+	return l
 }
 
+// WithLeftPanel sets the initial left panel.
 func WithLeftPanel(panel Container) SplitPaneOption {
 	return func(s *splitPaneLayout) {
 		s.leftPanel = panel
 	}
 }
 
+// WithRightPanel sets the initial right panel.
 func WithRightPanel(panel Container) SplitPaneOption {
 	return func(s *splitPaneLayout) {
 		s.rightPanel = panel
 	}
 }
 
+// WithRatio sets the horizontal split ratio allocated to the left panel.
 func WithRatio(ratio float64) SplitPaneOption {
 	return func(s *splitPaneLayout) {
 		s.ratio = ratio
 	}
 }
 
+// WithBottomPanel sets the initial bottom panel.
 func WithBottomPanel(panel Container) SplitPaneOption {
 	return func(s *splitPaneLayout) {
 		s.bottomPanel = panel
 	}
 }
 
+// WithVerticalRatio sets the vertical split ratio allocated to the top section.
 func WithVerticalRatio(ratio float64) SplitPaneOption {
 	return func(s *splitPaneLayout) {
 		s.verticalRatio = ratio
+	}
+}
+
+// WithSplitBackground sets a static background color behind the split panels.
+func WithSplitBackground(col color.Color) SplitPaneOption {
+	return func(s *splitPaneLayout) {
+		s.backgroundFunc = func() color.Color { return col }
+	}
+}
+
+// WithSplitBackgroundFunc sets a dynamic background color provider evaluated on
+// each draw.
+func WithSplitBackgroundFunc(fn func() color.Color) SplitPaneOption {
+	return func(s *splitPaneLayout) {
+		s.backgroundFunc = fn
 	}
 }

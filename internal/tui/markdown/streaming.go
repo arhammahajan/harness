@@ -1,0 +1,1052 @@
+package markdown
+
+import (
+	"strings"
+
+	"charm.land/glamour/v2"
+	"github.com/arhammahajan/harness/internal/tui/styles"
+)
+
+// StreamingMarkdown caches a "stable prefix" glamour render so each
+// streaming flush only re-renders the trailing portion of the
+// document.
+//
+// The boundary between "stable" and "trailing" is detected by
+// [findSafeMarkdownBoundary]: a position immediately after a blank
+// line at which we can prove no markdown construct is open
+// (fenced code block, list, table, block quote, setext header).
+//
+// Glamour renders a document block by block, so at a safe boundary the
+// raw render of the prefix followed by the raw render of the rest is
+// byte-identical to a render of the whole, with one exception: a block
+// that opens a document drops its leading separator. Pieces after the
+// first are therefore rendered behind a sentinel block that renders to
+// nothing (see [StreamingMarkdown.renderPiece]). Exactness rests on
+// findSafeMarkdownBoundary only allowing cuts where this holds.
+//
+// Invariants:
+//
+//   - stablePrefix is always a literal byte prefix of the most
+//     recently rendered content. If a new content does not have
+//     stablePrefix as its prefix the cache is dropped.
+//   - stablePrefixRender is the raw glamour render of stablePrefix as
+//     it appears within the whole document.
+//   - width is the glamour wrap width that produced
+//     stablePrefixRender. A width change drops the cache.
+type StreamingMarkdown struct {
+	width              int
+	stablePrefix       string
+	stablePrefixRender string
+	// Cached cumulative state at the stable prefix boundary.
+	// Used by findBoundaryAfter to validate new boundary candidates
+	// without re-scanning the entire prefix from the start.
+	// baseFenceCount is always even (safe boundaries require even
+	// fence parity), so the delta scan always starts outside a fence.
+	baseFenceCount    int
+	baseHasListMarker bool
+
+	// prefixShape describes stablePrefixRender's lines, and lastLines
+	// is the line count of whatever the most recent Render returned.
+	// Callers need the count to size a truncation hint; the shape keeps
+	// that O(trail) rather than an O(document) scan on every flush.
+	prefixShape lineShape
+	lastLines   int
+
+	// lastContent and lastRender memoize the most recent render at width.
+	lastContent string
+	lastRender  string
+}
+
+// LastLines reports the number of lines in the string the most recent
+// [StreamingMarkdown.Render] returned, with surrounding whitespace
+// trimmed. Equivalent to [CountLines] on that trimmed string, without
+// rescanning it.
+func (s *StreamingMarkdown) LastLines() int {
+	return s.lastLines
+}
+
+// StablePrefixLen returns the byte length of the currently cached
+// stable prefix.
+func (s *StreamingMarkdown) StablePrefixLen() int {
+	return len(s.stablePrefix)
+}
+
+// Reset drops every cached field. After Reset the next Render call
+// is guaranteed to be a full render.
+func (s *StreamingMarkdown) Reset() {
+	s.width = 0
+	s.stablePrefix = ""
+	s.stablePrefixRender = ""
+	s.baseFenceCount = 0
+	s.baseHasListMarker = false
+	s.prefixShape = lineShape{}
+	s.lastLines = 0
+	s.lastContent = ""
+	s.lastRender = ""
+}
+
+// Render returns the glamour render of content at the given width,
+// reusing the cached stable-prefix render when it is safe to do so.
+// On any uncertainty the call falls back to a full render via
+// renderer and leaves the cache untouched (or drops it).
+//
+// The returned string has its trailing newline trimmed.
+//
+// Concurrency: glamour's Render is stateful and not safe for
+// concurrent invocation on a shared renderer. We hold
+// [styles.LockMarkdownRenderer] for the entire prefix + trailing
+// render sequence so other goroutines cannot interleave their own
+// Render calls and corrupt goldmark's BlockStack.
+func (s *StreamingMarkdown) Render(content string, width int, renderer *glamour.TermRenderer) string {
+	if content != "" && content == s.lastContent && width == s.width {
+		return s.lastRender
+	}
+	out := s.render(content, width, renderer)
+	s.lastContent, s.lastRender = content, out
+	return out
+}
+
+func (s *StreamingMarkdown) render(content string, width int, renderer *glamour.TermRenderer) string {
+	if renderer == nil {
+		s.Reset()
+		s.width = width
+		s.lastLines = CountLines(trimGlamourMargins(content))
+		return content
+	}
+
+	mu := styles.LockMarkdownRenderer(renderer)
+	mu.Lock()
+	defer mu.Unlock()
+
+	full := func() string {
+		out, err := renderer.Render(content)
+		if err != nil {
+			out = content
+		} else {
+			out = strings.TrimSuffix(out, "\n")
+		}
+		// Counted against the trimmed form: that is what the
+		// windowing callers measure, and the glue paths below
+		// already return trimmed output.
+		s.lastLines = CountLines(trimGlamourMargins(out))
+		return out
+	}
+
+	// Width change OR content not a prefix-extension: drop cache and
+	// render in full. The prefix is seeded only once the content grows,
+	// so content that never grows renders exactly once.
+	if width != s.width || !strings.HasPrefix(content, s.stablePrefix) {
+		s.Reset()
+		s.width = width
+		return full()
+	}
+
+	// Incremental boundary search: only scan the delta after the
+	// stable prefix. The cached cumulative state (baseFenceCount,
+	// baseHasListMarker) lets us validate candidates in O(delta)
+	// instead of re-scanning the entire prefix.
+	boundary := s.findBoundaryAfter(content)
+	if boundary < 0 {
+		// No safe boundary anywhere yet. Full render; do not
+		// modify the cache (a future flush may find one).
+		return full()
+	}
+
+	if boundary > len(s.stablePrefix) {
+		// A new chunk of safe content: render it and promote the
+		// boundary.
+		newChunk := content[len(s.stablePrefix):boundary]
+		chunkRender, ok := s.renderPiece(newChunk, renderer)
+		if !ok {
+			s.Reset()
+			s.width = width
+			return full()
+		}
+		chunkRender = stripTrailingBlankStub(chunkRender)
+		s.prefixShape = s.prefixShape.join(shapeOf(chunkRender))
+		s.stablePrefixRender += chunkRender
+		s.stablePrefix = content[:boundary]
+		// Update cumulative state for the new stable prefix.
+		s.baseFenceCount += countFenceLines(newChunk)
+		s.baseHasListMarker = s.baseHasListMarker || chunkHasListMarker(newChunk)
+	}
+
+	trail, ok := s.renderPiece(content[len(s.stablePrefix):], renderer)
+	if !ok {
+		return full()
+	}
+	s.lastLines = s.prefixShape.join(shapeOf(trail)).lines()
+	return strings.TrimSuffix(s.stablePrefixRender+trail, "\n")
+}
+
+// CountLines returns the number of lines in s (i.e. the number of
+// newline-separated segments). Equivalent to len(strings.Split(s,
+// "\n")) but allocates nothing.
+func CountLines(s string) int {
+	if s == "" {
+		return 1
+	}
+	n := 1
+	for i := 0; i < len(s); i++ {
+		if s[i] == '\n' {
+			n++
+		}
+	}
+	return n
+}
+
+// TailLines returns the last n lines of s and the count of hidden
+// (earlier) lines. totalLines is the pre-computed line count of s
+// (from [CountLines]). It finds the cut point with a bounded backward
+// scan so the cost is O(n) in the number of kept lines, not O(L)
+// in the total document length.
+func TailLines(s string, n, totalLines int) (tail string, hidden int) {
+	if n <= 0 {
+		return "", totalLines
+	}
+	if totalLines <= n {
+		return s, 0
+	}
+	// Find the nth newline from the end. The tail starts after it.
+	count := 0
+	for i := len(s) - 1; i >= 0; i-- {
+		if s[i] == '\n' {
+			count++
+			if count == n {
+				return s[i+1:], totalLines - n
+			}
+		}
+	}
+	return s, 0
+}
+
+// findBoundaryAfter searches for the latest safe boundary in content
+// that is strictly after the stable prefix. It uses the cached
+// cumulative state (baseFenceCount, baseHasListMarker) to validate
+// candidates without re-scanning the entire prefix, making the search
+// O(delta) instead of O(n) per tick.
+//
+// Returns -1 when no safe boundary exists after the stable prefix.
+func (s *StreamingMarkdown) findBoundaryAfter(content string) int {
+	// When there is no stable prefix, fall back to the full scan.
+	if len(s.stablePrefix) == 0 {
+		if b := findSafeMarkdownBoundary(content); b > 0 {
+			return b
+		}
+		return s.relaxedBoundary(content, 0)
+	}
+
+	// Scan blank-line candidates from latest to earliest, but only
+	// those strictly after the stable prefix. Candidates at or
+	// before the stable prefix are already covered by the cache.
+	for p := blankLineBefore(content, len(content)); p > len(s.stablePrefix); p = blankLineBefore(content, p-1) {
+		if s.isSafeBoundaryIncremental(content, p) {
+			return p
+		}
+	}
+	if b := s.relaxedBoundary(content, len(s.stablePrefix)); b > len(s.stablePrefix) {
+		return b
+	}
+	// No new boundary found after the stable prefix. Return the
+	// stable prefix length so the caller takes the "boundary <=
+	// len(stablePrefix)" path (render trailing fresh, keep cache).
+	return len(s.stablePrefix)
+}
+
+// relaxBoundaryAfter bounds how much unstable tail a flush will
+// re-render. Prose holding no blank line never satisfies the
+// blank-line predicate, so the cache never advances and every flush
+// re-renders the whole document: O(n) per tick, O(n^2) over a turn. A
+// reasoning trace that reaches a few hundred KB burns tens of GB of
+// churn that way, which is enough to outrun the GC.
+// Sized just above a prose paragraph so structured text never reaches
+// it: the blank-line boundary fires first and the tail stays small.
+// Only prose with no paragraph breaks at all gets cut here, and it has
+// no reflow left to protect.
+const relaxBoundaryAfter = 2 << 10
+
+// relaxedBoundaryCandidates caps how many newline candidates one
+// flush will validate, keeping the search cost flat when none of them
+// pass.
+const relaxedBoundaryCandidates = 8
+
+// relaxedBoundary looks for a cut at a plain newline once the tail
+// after `after` has outgrown [relaxBoundaryAfter]. Candidates are
+// still validated by the same predicate the blank-line search uses,
+// so every construct check survives; the only conservatism given up
+// is paragraph wrapping across the cut, which costs one re-wrap at a
+// point the reader has usually already scrolled past.
+//
+// Returns -1 while the tail is still small, and when no candidate
+// validates — the caller then behaves exactly as it did before.
+// Content with no newline at all has nothing to cut on and stays on
+// the full-render path.
+func (s *StreamingMarkdown) relaxedBoundary(content string, after int) int {
+	if len(content)-after <= relaxBoundaryAfter {
+		return -1
+	}
+	tried := 0
+	for p := newlineBefore(content, len(content)); p > after; p = newlineBefore(content, p-1) {
+		if s.isSafeBoundaryIncremental(content, p) {
+			return p
+		}
+		if tried++; tried >= relaxedBoundaryCandidates {
+			break
+		}
+	}
+	return -1
+}
+
+// newlineBefore returns the byte offset of the first character AFTER
+// the latest newline that ends strictly before `until`, or -1 when
+// there is none.
+func newlineBefore(content string, until int) int {
+	if until <= 0 {
+		return -1
+	}
+	nl := strings.LastIndexByte(content[:until], '\n')
+	if nl < 0 {
+		return -1
+	}
+	return nl + 1
+}
+
+// isSafeBoundaryIncremental validates a boundary candidate at
+// position p using the cached cumulative state plus a delta scan
+// of content[len(stablePrefix):p]. This avoids the O(n) re-scan
+// that isSafeBoundaryAt performs on every candidate.
+func (s *StreamingMarkdown) isSafeBoundaryIncremental(content string, p int) bool {
+	delta := content[len(s.stablePrefix):p]
+
+	// (2) Fence parity: base count + delta count must be even.
+	if (s.baseFenceCount+countFenceLines(delta))%2 != 0 {
+		return false
+	}
+
+	// (2b) HTML and link-ref hazards in the delta.
+	if deltaHasHTMLorRef(delta) {
+		return false
+	}
+
+	// (2b) List hazard: if a list marker exists anywhere in the
+	// full prefix (base OR delta), the last non-blank line before
+	// the boundary must not be an indented continuation paragraph.
+	hasListMarker := s.baseHasListMarker || chunkHasListMarker(delta)
+	if hasListMarker {
+		lastLine := lastNonBlankLine(content[:p])
+		if lastLine != "" && !isListItemMarker(strings.TrimLeft(lastLine, " \t")) {
+			if len(lastLine) > 0 && (lastLine[0] == ' ' || lastLine[0] == '\t') {
+				return false
+			}
+		}
+	}
+
+	// (3) Last non-blank line must not open a construct.
+	lastLine := lastNonBlankLine(content[:p])
+	if lastLine != "" && lineOpensConstruct(lastLine) {
+		return false
+	}
+
+	// (4) Setext underline check.
+	if rest := content[p:]; rest != "" {
+		first := firstNonBlankLine(rest)
+		if isSetextUnderlineCandidate(first) {
+			return false
+		}
+	}
+
+	return true
+}
+
+// deltaHasHTMLorRef reports whether the delta (text between the
+// stable prefix and a boundary candidate) contains an HTML block
+// opener or a link reference definition.
+func deltaHasHTMLorRef(delta string) bool {
+	inFence := false
+	for line := range splitLines(delta) {
+		if isFenceLine(line) {
+			inFence = !inFence
+			continue
+		}
+		if inFence {
+			continue
+		}
+		if isHTMLBlockOpener(line) || isLinkRefDefinition(line) {
+			return true
+		}
+	}
+	return false
+}
+
+// chunkHasListMarker reports whether any line in chunk is a
+// list-item marker (outside fenced code blocks).
+func chunkHasListMarker(chunk string) bool {
+	inFence := false
+	for line := range splitLines(chunk) {
+		if isFenceLine(line) {
+			inFence = !inFence
+			continue
+		}
+		if inFence {
+			continue
+		}
+		if isListItemMarker(strings.TrimLeft(line, " \t")) {
+			return true
+		}
+	}
+	return false
+}
+
+// markdownSentinel is an empty HTML comment rendered ahead of a piece so
+// its first block keeps the separator it has mid-document. It renders to
+// nothing, so the output needs no slicing.
+const markdownSentinel = "<!---->\n\n"
+
+// renderPiece returns the raw render of text as it appears right after
+// stablePrefix in the whole document. It reports false on a render error,
+// and the caller must then render the whole document instead.
+func (s *StreamingMarkdown) renderPiece(text string, renderer *glamour.TermRenderer) (string, bool) {
+	if text == "" {
+		return "", true
+	}
+	if s.stablePrefix != "" {
+		text = markdownSentinel + text
+	}
+	out, err := renderer.Render(text)
+	return out, err == nil
+}
+
+// stripTrailingBlankStub removes an unterminated trailing line that
+// contains only spaces, tabs, and ANSI CSI sequences.
+//
+// When glamour renders a style with non-zero Document or CodeBlock
+// margins, blocks that emit a trailing newline followed by an ANSI
+// reset (such as headings with BlockSuffix="\n" or highlighted code
+// blocks) cause IndentWriter to start an unterminated margin-only line
+// after the final '\n'. Concatenating the next piece onto that stub
+// would prepend its margin spaces to the next piece's leading blank
+// line and push it past the configured wrap width.
+func stripTrailingBlankStub(s string) string {
+	lastNL := strings.LastIndexByte(s, '\n')
+	if lastNL < 0 || lastNL == len(s)-1 {
+		return s
+	}
+	tail := s[lastNL+1:]
+	for i := 0; i < len(tail); {
+		switch tail[i] {
+		case ' ', '\t':
+			i++
+		case 0x1b:
+			if i+1 >= len(tail) || tail[i+1] != '[' {
+				return s
+			}
+			j := i + 2
+			for j < len(tail) && (tail[j] < 0x40 || tail[j] > 0x7e) {
+				j++
+			}
+			if j >= len(tail) {
+				return s
+			}
+			i = j + 1
+		default:
+			return s
+		}
+	}
+	return s[:lastNL+1]
+}
+
+// lineShape summarizes a string's newlines so the line count of
+// trimGlamourMargins over a concatenation follows from its parts.
+type lineShape struct {
+	newlines int
+	// lead and trail count the newlines in the leading and trailing
+	// whitespace runs; both cover everything when there is no content.
+	lead, trail int
+	content     bool
+}
+
+func shapeOf(text string) lineShape {
+	var shape lineShape
+	for idx := 0; idx < len(text); idx++ {
+		switch text[idx] {
+		case '\n':
+			shape.newlines++
+			if !shape.content {
+				shape.lead++
+			}
+			shape.trail++
+		case ' ', '\t':
+		default:
+			shape.content = true
+			shape.trail = 0
+		}
+	}
+	return shape
+}
+
+// join returns the shape of a followed by next.
+func (a lineShape) join(next lineShape) lineShape {
+	out := lineShape{newlines: a.newlines + next.newlines, content: a.content || next.content}
+	out.lead = a.lead
+	if !a.content {
+		out.lead += next.lead
+	}
+	out.trail = next.trail
+	if !next.content {
+		out.trail += a.trail
+	}
+	return out
+}
+
+// lines is CountLines(trimGlamourMargins(text)) for the shaped text.
+func (a lineShape) lines() int {
+	if !a.content {
+		return 1
+	}
+	return a.newlines - a.lead - a.trail + 1
+}
+
+// trimGlamourMargins strips leading and trailing whitespace
+// (including newlines) from a glamour-rendered fragment.
+// Glamour adds a leading blank line for documents that open with
+// a heading or paragraph, plus a trailing newline; both must be
+// removed before counting or concatenation.
+func trimGlamourMargins(s string) string {
+	return strings.Trim(s, " \t\n")
+}
+
+// findSafeMarkdownBoundary returns the byte offset of the END of
+// the latest safe boundary in content, i.e. the offset such that
+// content[:boundary] is a valid stable-prefix candidate. The
+// returned offset always points immediately after a blank-line
+// separator, so concatenating a fresh render of content[boundary:]
+// to a cached render of content[:boundary] does not require glamour
+// to share state across the cut.
+//
+// Returns -1 when no safe boundary exists. SAFETY FIRST: any time
+// we have the slightest doubt we return -1 and let the caller fall
+// back to a full render.
+//
+// Decision tree, in order of preference (latest boundary wins):
+//
+//  1. Walk backward through every "blank line" position p such that
+//     content[:p] ends with "\n\n" (or "\n[ \t]*\n").
+//  2. For each candidate, check that content[:p] has an even
+//     number of triple-backtick/tilde fence lines (no open fenced
+//     block). Any odd count means we'd be cutting inside a fence
+//     and mis-syntax-highlighting the trailing partial.
+//     2b. Reject if content[:p] has an anywhere-in-prefix hazard
+//     (loose list continuation B1, HTML-block opener B2, or link
+//     reference definition B3). See [prefixHasOpenHazard].
+//  3. Reject if the last non-blank line of content[:p] is:
+//     - a list item marker line ("^\s*([-*+]|\d+[.)])\s")
+//     - a table line (contains "|")
+//     - a block quote ("^\s*>")
+//     - a setext header underline ("^=+\s*$" or "^-+\s*$")
+//     - an indented code line (4+ leading spaces or a tab)
+//  4. Reject if the line immediately AFTER the boundary (skipping
+//     leading blank lines) looks like a setext underline (a line
+//     of '=' or '-' only). Rendering the prefix as a paragraph
+//     would change once the underline arrived.
+//
+// Returns the byte offset of the first character AFTER the blank
+// line, i.e. the start of the trailing segment.
+func findSafeMarkdownBoundary(content string) int {
+	if len(content) == 0 {
+		return -1
+	}
+
+	// Iterate every blank-line position from latest to earliest.
+	for p := blankLineBefore(content, len(content)); p > 0; p = blankLineBefore(content, p-1) {
+		if !isSafeBoundaryAt(content, p) {
+			continue
+		}
+		return p
+	}
+	return -1
+}
+
+// blankLineBefore returns the byte offset of the first character
+// AFTER the latest blank-line separator that ends strictly before
+// `until`. A blank-line separator is a sequence "\n([ \t]*\n)+"
+// — one newline, then one or more lines containing only spaces or
+// tabs and terminated by another newline. The returned offset is
+// the start of the first non-blank line that follows the
+// separator (or the position immediately after the final newline,
+// if no further content remains).
+//
+// Returns -1 when no blank-line separator exists before `until`.
+func blankLineBefore(content string, until int) int {
+	if until <= 0 {
+		return -1
+	}
+	// Walk backward looking for a newline followed (after optional
+	// blank-line content) by another newline. We track the latest
+	// newline we've seen; if the next earlier newline has only
+	// blank chars between them, we have a blank-line separator
+	// and the boundary sits immediately after the latest newline.
+	end := until
+	for end > 0 {
+		nl := strings.LastIndexByte(content[:end], '\n')
+		if nl < 0 {
+			return -1
+		}
+		// Look for an earlier newline whose gap to nl is empty
+		// or whitespace only.
+		prev := strings.LastIndexByte(content[:nl], '\n')
+		for prev >= 0 {
+			gap := content[prev+1 : nl]
+			if isBlankOrSpaces(gap) {
+				return nl + 1
+			}
+			// Gap had non-whitespace; nl is not a blank-line
+			// separator. Move up: try with the earlier newline as
+			// the new "nl" candidate.
+			break
+		}
+		end = nl
+	}
+	return -1
+}
+
+// isBlankOrSpaces reports whether s consists entirely of spaces
+// and tabs (or is empty).
+func isBlankOrSpaces(s string) bool {
+	for i := range len(s) {
+		if s[i] != ' ' && s[i] != '\t' {
+			return false
+		}
+	}
+	return true
+}
+
+// isSafeBoundaryAt reports whether content[:p] is a safe stable
+// prefix. p must be a blank-line boundary (start of a line, with a
+// blank line immediately preceding).
+//
+// Beyond the last-line checks, three "anywhere in the prefix"
+// hazards force a reject because they cannot be reliably reasoned
+// about by inspecting the trailing line alone. For each of these
+// the simplest, safest rule was chosen — see [prefixHasOpenHazard].
+func isSafeBoundaryAt(content string, p int) bool {
+	prefix := content[:p]
+
+	// (2) Even number of triple-backtick/tilde fence lines.
+	if countFenceLines(prefix)%2 != 0 {
+		return false
+	}
+
+	// (2b) Anywhere-in-prefix hazards: open list (B1), HTML block
+	// opener (B2), reference link definition (B3).
+	if prefixHasOpenHazard(prefix) {
+		return false
+	}
+
+	// (3) Inspect the last non-blank line of the prefix.
+	lastLine := lastNonBlankLine(prefix)
+	if lastLine != "" && lineOpensConstruct(lastLine) {
+		return false
+	}
+
+	// (4) If anything follows, make sure it doesn't look like a
+	// setext underline that would retroactively turn the last
+	// paragraph of the prefix into a header.
+	if rest := content[p:]; rest != "" {
+		first := firstNonBlankLine(rest)
+		if isSetextUnderlineCandidate(first) {
+			return false
+		}
+	}
+
+	return true
+}
+
+// prefixHasOpenHazard reports whether prefix contains any of three
+// constructs that cannot be safely cut at a blank-line boundary
+// even when the immediately preceding line looks fine:
+//
+//	B1 (loose lists). A loose list has a blank line between an item
+//	   and a continuation paragraph that begins with indentation
+//	   but no list marker. Track whether any list-marker line
+//	   appears in the prefix. If one does AND the last non-blank
+//	   line is indented (but is not itself a list marker), the list
+//	   is potentially open and we reject. A list followed by a
+//	   blank line and then a non-indented paragraph is closed; the
+//	   boundary after that paragraph is safe.
+//
+//	B2 (HTML blocks). CommonMark defines seven HTML-block opener
+//	   patterns (script/pre/style/textarea, comments, processing
+//	   instructions, CDATA, declarations, recognised tag names,
+//	   generic open/close tags). Any HTML-block opener anywhere in
+//	   the prefix forces a reject.
+//
+//	B3 (reference link definitions). A line of the form
+//	   "[label]: <url>" defines a link reference that the suffix
+//	   may later use. Any reference link definition anywhere in the
+//	   prefix forces a reject.
+func prefixHasOpenHazard(prefix string) bool {
+	inFence := false
+	hasListMarker := false
+	var lastNonBlankTrimmed string
+	var lastNonBlankRaw string
+	for line := range splitLines(prefix) {
+		// Track fenced state so list/html/ref patterns inside a
+		// fenced code block do not falsely trigger the hazards.
+		if isFenceLine(line) {
+			inFence = !inFence
+			continue
+		}
+		if inFence {
+			continue
+		}
+		trimmed := strings.TrimLeft(line, " \t")
+		if trimmed == "" {
+			continue
+		}
+		lastNonBlankTrimmed = trimmed
+		lastNonBlankRaw = line
+		// B1: track list markers.
+		if isListItemMarker(trimmed) {
+			hasListMarker = true
+		}
+		// B2: HTML block opener.
+		if isHTMLBlockOpener(line) {
+			return true
+		}
+		// B3: link reference definition.
+		if isLinkRefDefinition(line) {
+			return true
+		}
+	}
+	// B1 (refined): a list is potentially open only when a marker
+	// appeared earlier AND the last non-blank line is indented but
+	// is not itself a list marker (i.e. it is a continuation
+	// paragraph that lineOpensConstruct would miss because it only
+	// catches 4+ leading spaces). A non-indented last line means
+	// the list was closed by the blank line before it.
+	if hasListMarker && lastNonBlankTrimmed != "" && !isListItemMarker(lastNonBlankTrimmed) {
+		if len(lastNonBlankRaw) > 0 && (lastNonBlankRaw[0] == ' ' || lastNonBlankRaw[0] == '\t') {
+			return true
+		}
+	}
+	return false
+}
+
+// countFenceLines counts lines that begin a fenced code block in
+// the CommonMark sense: a line whose first non-whitespace run is
+// at least three consecutive backticks (or tildes). Each such
+// line toggles the fenced state, so an even count means every
+// opened fence has been closed.
+//
+// We accept up to three leading spaces of indentation (CommonMark
+// rule) and require the fence characters to be the FIRST
+// non-whitespace content of the line. We deliberately do NOT
+// attempt to parse info-strings or differentiate opener from
+// closer beyond toggling — a closing fence is just any line
+// whose first non-whitespace run is >=3 of the same fence char.
+func countFenceLines(s string) int {
+	n := 0
+	for line := range splitLines(s) {
+		if isFenceLine(line) {
+			n++
+		}
+	}
+	return n
+}
+
+// isFenceLine reports whether line opens or closes a fenced code
+// block.
+func isFenceLine(line string) bool {
+	// Strip up to 3 spaces of indentation.
+	i := 0
+	for i < len(line) && i < 3 && line[i] == ' ' {
+		i++
+	}
+	if i >= len(line) {
+		return false
+	}
+	c := line[i]
+	if c != '`' && c != '~' {
+		return false
+	}
+	run := 0
+	for i < len(line) && line[i] == c {
+		i++
+		run++
+	}
+	return run >= 3
+}
+
+// lastNonBlankLine returns the last non-blank line of s, or ""
+// when every line is blank.
+func lastNonBlankLine(s string) string {
+	last := ""
+	for line := range splitLines(s) {
+		if strings.TrimSpace(line) != "" {
+			last = line
+		}
+	}
+	return last
+}
+
+// firstNonBlankLine returns the first non-blank line of s, or ""
+// when every line is blank.
+func firstNonBlankLine(s string) string {
+	for line := range splitLines(s) {
+		if strings.TrimSpace(line) != "" {
+			return line
+		}
+	}
+	return ""
+}
+
+// splitLines yields the lines of s without their terminators. The
+// final segment is yielded even if not newline-terminated.
+func splitLines(s string) func(yield func(string) bool) {
+	return func(yield func(string) bool) {
+		start := 0
+		for i := 0; i < len(s); i++ {
+			if s[i] == '\n' {
+				if !yield(s[start:i]) {
+					return
+				}
+				start = i + 1
+			}
+		}
+		if start <= len(s)-1 {
+			yield(s[start:])
+		}
+	}
+}
+
+// lineOpensConstruct reports whether line keeps a markdown
+// construct open across the boundary. We err conservatively —
+// any case that smells like list/table/quote/setext/indented-code
+// returns true.
+func lineOpensConstruct(line string) bool {
+	// Indented code: a tab, or 4+ leading spaces.
+	if len(line) > 0 && line[0] == '\t' {
+		return true
+	}
+	if strings.HasPrefix(line, "    ") {
+		return true
+	}
+
+	trimmed := strings.TrimLeft(line, " \t")
+	if trimmed == "" {
+		return false
+	}
+
+	// Block quote.
+	if trimmed[0] == '>' {
+		return true
+	}
+
+	// List item: "- " "* " "+ " or "<digits>. " or "<digits>) ".
+	if isListItemMarker(trimmed) {
+		return true
+	}
+
+	// Table: any pipe character anywhere in the line. Conservative:
+	// pipe-in-prose is rare and the cost of bailing is one slow
+	// frame.
+	if strings.ContainsRune(line, '|') {
+		return true
+	}
+
+	// Setext underline candidate as the LAST line of the prefix:
+	// this would be a setext header for an even-earlier paragraph.
+	// Refuse to split at all in this case — the boundary is right
+	// in the middle of a header.
+	if isSetextUnderlineCandidate(trimmed) {
+		return true
+	}
+
+	return false
+}
+
+// isListItemMarker reports whether line (already left-trimmed)
+// starts with a CommonMark list-item marker followed by a space
+// or tab.
+func isListItemMarker(line string) bool {
+	if line == "" {
+		return false
+	}
+	c := line[0]
+	if c == '-' || c == '*' || c == '+' {
+		if len(line) >= 2 && (line[1] == ' ' || line[1] == '\t') {
+			return true
+		}
+		return false
+	}
+	// Ordered list: digits followed by '.' or ')' and a space.
+	i := 0
+	for i < len(line) && line[i] >= '0' && line[i] <= '9' {
+		i++
+	}
+	if i == 0 || i > 9 {
+		return false
+	}
+	if i >= len(line) {
+		return false
+	}
+	if line[i] != '.' && line[i] != ')' {
+		return false
+	}
+	if i+1 >= len(line) {
+		return false
+	}
+	return line[i+1] == ' ' || line[i+1] == '\t'
+}
+
+// isSetextUnderlineCandidate reports whether line (with optional
+// leading whitespace) consists entirely of '=' or entirely of '-'
+// characters with optional trailing whitespace. CommonMark
+// requires no leading whitespace on the underline; we accept up
+// to three spaces for safety so an indented underline still
+// blocks a split.
+func isSetextUnderlineCandidate(line string) bool {
+	// Strip leading whitespace.
+	i := 0
+	for i < len(line) && (line[i] == ' ' || line[i] == '\t') {
+		i++
+	}
+	if i == len(line) {
+		return false
+	}
+	c := line[i]
+	if c != '=' && c != '-' {
+		return false
+	}
+	j := i
+	for j < len(line) && line[j] == c {
+		j++
+	}
+	// Allow trailing whitespace.
+	for j < len(line) {
+		if line[j] != ' ' && line[j] != '\t' {
+			return false
+		}
+		j++
+	}
+	// Need at least one underline character. "-" alone is also a
+	// list marker without a trailing space; the listItem check
+	// covers the marker case before we get here.
+	return j-i >= 1
+}
+
+// isHTMLBlockOpener reports whether line begins one of the seven
+// CommonMark HTML block patterns. We accept up to three spaces of
+// leading indentation (CommonMark rule). Matching is intentionally
+// loose — we only need to know the line "looks like an HTML
+// block start", not parse the contained markup.
+func isHTMLBlockOpener(line string) bool {
+	// Strip up to 3 spaces of indentation.
+	i := 0
+	for i < len(line) && i < 3 && line[i] == ' ' {
+		i++
+	}
+	rest := line[i:]
+	if len(rest) < 2 || rest[0] != '<' {
+		return false
+	}
+
+	// Type 2: HTML comment "<!--".
+	if strings.HasPrefix(rest, "<!--") {
+		return true
+	}
+	// Type 3: processing instruction "<?".
+	if strings.HasPrefix(rest, "<?") {
+		return true
+	}
+	// Type 5: CDATA "<![CDATA[".
+	if strings.HasPrefix(rest, "<![CDATA[") {
+		return true
+	}
+	// Type 4: declaration "<!" followed by an ASCII letter.
+	if len(rest) >= 3 && rest[1] == '!' && isASCIILetter(rest[2]) {
+		return true
+	}
+
+	// Type 1: <script | <pre | <style | <textarea (case-insensitive)
+	// followed by whitespace, '>', end-of-line, or other non-name
+	// terminators. Use a permissive HasPrefix check on lowercase.
+	low := strings.ToLower(rest)
+	for _, t := range []string{"<script", "<pre", "<style", "<textarea"} {
+		if strings.HasPrefix(low, t) {
+			next := byte(0)
+			if len(low) > len(t) {
+				next = low[len(t)]
+			}
+			if next == 0 || next == ' ' || next == '\t' || next == '>' {
+				return true
+			}
+		}
+	}
+
+	// Types 6 & 7: open or close of a block-level tag.
+	//
+	// Type 6 matches a fixed CommonMark tag set; type 7 matches any
+	// otherwise-valid open/close tag whose name is not in the
+	// script/pre/style/textarea family. We collapse both into a
+	// single check: the line must start with '<' or '</' followed
+	// by an ASCII letter. This deliberately mirrors the other
+	// hazards — when in doubt, forfeit the boundary. Lines like
+	// "<3", "<-", "<<", or mid-line "<foo>" do NOT trigger because
+	// we require the line to *start* (after up to 3 spaces) with
+	// '<letter' or '</letter'.
+	j := 1 // past '<'
+	if j < len(rest) && rest[j] == '/' {
+		j++
+	}
+	if j >= len(rest) || !isASCIILetter(rest[j]) {
+		return false
+	}
+	return true
+}
+
+// isASCIILetter reports whether b is an ASCII letter.
+func isASCIILetter(b byte) bool {
+	return (b >= 'a' && b <= 'z') || (b >= 'A' && b <= 'Z')
+}
+
+// isLinkRefDefinition reports whether line matches a CommonMark
+// link reference definition opener. The conservative pattern:
+//
+//	^[ ]{0,3}\[[^\]]+\]:\s*\S+
+//
+// i.e. up to 3 spaces, then a bracketed label (no nested ']'),
+// then a colon, then whitespace, then at least one non-whitespace
+// character of destination. We do not validate the destination —
+// presence of a ref-def opener anywhere in the prefix is enough
+// to forfeit the boundary.
+func isLinkRefDefinition(line string) bool {
+	i := 0
+	for i < len(line) && i < 3 && line[i] == ' ' {
+		i++
+	}
+	if i >= len(line) || line[i] != '[' {
+		return false
+	}
+	i++
+	labelStart := i
+	for i < len(line) && line[i] != ']' {
+		i++
+	}
+	if i >= len(line) || i == labelStart {
+		// No closing bracket, or empty label.
+		return false
+	}
+	// i points at ']'.
+	i++
+	if i >= len(line) || line[i] != ':' {
+		return false
+	}
+	i++
+	// Skip required whitespace.
+	for i < len(line) && (line[i] == ' ' || line[i] == '\t') {
+		i++
+	}
+	// At least one non-whitespace character of destination.
+	return i < len(line)
+}

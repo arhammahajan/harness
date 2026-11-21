@@ -1,9 +1,9 @@
 package utilComponents
 
 import (
-	"github.com/charmbracelet/bubbles/key"
-	tea "github.com/charmbracelet/bubbletea"
-	"github.com/charmbracelet/lipgloss"
+	"charm.land/bubbles/v2/key"
+	tea "charm.land/bubbletea/v2"
+	"charm.land/lipgloss/v2"
 	"github.com/arhammahajan/harness/internal/tui/layout"
 	"github.com/arhammahajan/harness/internal/tui/styles"
 	"github.com/arhammahajan/harness/internal/tui/theme"
@@ -16,6 +16,7 @@ type SimpleListItem interface {
 type SimpleList[T SimpleListItem] interface {
 	tea.Model
 	layout.Bindings
+	Render() string
 	SetMaxWidth(maxWidth int)
 	GetSelectedItem() (item T, idx int)
 	SetItems(items []T)
@@ -65,7 +66,7 @@ func (c *simpleListCmp[T]) Init() tea.Cmd {
 
 func (c *simpleListCmp[T]) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	switch msg := msg.(type) {
-	case tea.KeyMsg:
+	case tea.KeyPressMsg:
 		switch {
 		case key.Matches(msg, simpleListKeys.Up) || (c.useAlphaNumericKeys && key.Matches(msg, simpleListKeys.UpAlpha)):
 			if c.selectedIdx > 0 {
@@ -88,7 +89,7 @@ func (c *simpleListCmp[T]) BindingKeys() []key.Binding {
 }
 
 func (c *simpleListCmp[T]) GetSelectedItem() (T, int) {
-	if len(c.items) > 0 {
+	if len(c.items) > 0 && c.selectedIdx >= 0 && c.selectedIdx < len(c.items) {
 		return c.items[c.selectedIdx], c.selectedIdx
 	}
 
@@ -109,7 +110,7 @@ func (c *simpleListCmp[T]) SetMaxWidth(width int) {
 	c.maxWidth = width
 }
 
-func (c *simpleListCmp[T]) View() string {
+func (c *simpleListCmp[T]) Render() string {
 	t := theme.CurrentTheme()
 	baseStyle := styles.BaseStyle()
 
@@ -146,6 +147,10 @@ func (c *simpleListCmp[T]) View() string {
 	}
 
 	return lipgloss.JoinVertical(lipgloss.Left, listItems...)
+}
+
+func (c *simpleListCmp[T]) View() tea.View {
+	return tea.NewView(c.Render())
 }
 
 func NewSimpleList[T SimpleListItem](items []T, maxVisibleItems int, fallbackMsg string, useAlphaNumericKeys bool) SimpleList[T] {

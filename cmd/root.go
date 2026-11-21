@@ -7,8 +7,8 @@ import (
 	"sync"
 	"time"
 
-	tea "github.com/charmbracelet/bubbletea"
-	zone "github.com/lrstanley/bubblezone"
+	tea "charm.land/bubbletea/v2"
+	uv "github.com/charmbracelet/ultraviolet"
 	"github.com/arhammahajan/harness/internal/app"
 	"github.com/arhammahajan/harness/internal/config"
 	"github.com/arhammahajan/harness/internal/db"
@@ -17,6 +17,7 @@ import (
 	"github.com/arhammahajan/harness/internal/logging"
 	"github.com/arhammahajan/harness/internal/pubsub"
 	"github.com/arhammahajan/harness/internal/tui"
+	"github.com/arhammahajan/harness/internal/tui/render"
 	"github.com/arhammahajan/harness/internal/version"
 	"github.com/spf13/cobra"
 )
@@ -115,11 +116,15 @@ to assist developers in writing, debugging, and understanding code directly from
 		}
 
 		// Interactive mode
-		// Set up the TUI
-		zone.NewGlobal()
+		// Set up the TUI with Crush's Bubble Tea v2 / Ultraviolet options and
+		// 60 Hz mouse input coalescing filter.
+		inputFilter := render.NewFilter()
+		var env uv.Environ = os.Environ()
 		program := tea.NewProgram(
 			tui.New(app),
-			tea.WithAltScreen(),
+			tea.WithEnvironment(env),
+			tea.WithContext(ctx),
+			tea.WithFilter(inputFilter.Filter),
 		)
 
 		// Setup the subscriptions, this will send services events to the TUI

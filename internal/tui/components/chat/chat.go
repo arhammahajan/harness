@@ -4,7 +4,7 @@ import (
 	"fmt"
 	"sort"
 
-	"github.com/charmbracelet/lipgloss"
+	"charm.land/lipgloss/v2"
 	"github.com/charmbracelet/x/ansi"
 	"github.com/arhammahajan/harness/internal/config"
 	"github.com/arhammahajan/harness/internal/message"
@@ -25,9 +25,16 @@ type SessionClearedMsg struct{}
 
 type EditorFocusMsg bool
 
+func workingDirectory() string {
+	if cfg := config.Get(); cfg != nil {
+		return cfg.WorkingDir
+	}
+	return ""
+}
+
 func header(width int) string {
 	return lipgloss.JoinVertical(
-		lipgloss.Top,
+		lipgloss.Left,
 		logo(width),
 		repo(width),
 		"",
@@ -36,6 +43,7 @@ func header(width int) string {
 }
 
 func lspsConfigured(width int) string {
+	width = max(1, width)
 	cfg := config.Get()
 	title := "LSP Configuration"
 	title = ansi.Truncate(title, width, "…")
@@ -51,8 +59,10 @@ func lspsConfigured(width int) string {
 
 	// Get LSP names and sort them for consistent ordering
 	var lspNames []string
-	for name := range cfg.LSP {
-		lspNames = append(lspNames, name)
+	if cfg != nil {
+		for name := range cfg.LSP {
+			lspNames = append(lspNames, name)
+		}
 	}
 	sort.Strings(lspNames)
 
@@ -64,7 +74,8 @@ func lspsConfigured(width int) string {
 			Render(fmt.Sprintf("• %s", name))
 
 		cmd := lsp.Command
-		cmd = ansi.Truncate(cmd, width-lipgloss.Width(lspName)-3, "…")
+		avail := max(0, width-lipgloss.Width(lspName)-3)
+		cmd = ansi.Truncate(cmd, avail, "…")
 
 		lspPath := baseStyle.
 			Foreground(t.TextMuted()).
@@ -75,7 +86,7 @@ func lspsConfigured(width int) string {
 				Width(width).
 				Render(
 					lipgloss.JoinHorizontal(
-						lipgloss.Left,
+						lipgloss.Top,
 						lspName,
 						lspPath,
 					),
@@ -98,6 +109,7 @@ func lspsConfigured(width int) string {
 }
 
 func logo(width int) string {
+	width = max(1, width)
 	logo := fmt.Sprintf("%s %s", styles.HarnessIcon, "Harness")
 	t := theme.CurrentTheme()
 	baseStyle := styles.BaseStyle()
@@ -111,7 +123,7 @@ func logo(width int) string {
 		Width(width).
 		Render(
 			lipgloss.JoinHorizontal(
-				lipgloss.Left,
+				lipgloss.Top,
 				logo,
 				" ",
 				versionText,
@@ -120,6 +132,7 @@ func logo(width int) string {
 }
 
 func repo(width int) string {
+	width = max(1, width)
 	repo := "https://github.com/arhammahajan/harness"
 	t := theme.CurrentTheme()
 
@@ -130,7 +143,8 @@ func repo(width int) string {
 }
 
 func cwd(width int) string {
-	cwd := fmt.Sprintf("cwd: %s", config.WorkingDirectory())
+	width = max(1, width)
+	cwd := fmt.Sprintf("cwd: %s", workingDirectory())
 	t := theme.CurrentTheme()
 
 	return styles.BaseStyle().
@@ -138,4 +152,3 @@ func cwd(width int) string {
 		Width(width).
 		Render(cwd)
 }
-

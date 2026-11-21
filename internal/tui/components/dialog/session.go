@@ -1,9 +1,10 @@
 package dialog
 
 import (
-	"github.com/charmbracelet/bubbles/key"
-	tea "github.com/charmbracelet/bubbletea"
-	"github.com/charmbracelet/lipgloss"
+	"charm.land/bubbles/v2/key"
+	tea "charm.land/bubbletea/v2"
+	"charm.land/lipgloss/v2"
+	uv "github.com/charmbracelet/ultraviolet"
 	"github.com/arhammahajan/harness/internal/session"
 	"github.com/arhammahajan/harness/internal/tui/layout"
 	"github.com/arhammahajan/harness/internal/tui/styles"
@@ -23,6 +24,7 @@ type CloseSessionDialogMsg struct{}
 type SessionDialog interface {
 	tea.Model
 	layout.Bindings
+	layout.Drawable
 	SetSessions(sessions []session.Session)
 	SetSelectedSession(sessionID string)
 }
@@ -77,7 +79,7 @@ func (s *sessionDialogCmp) Init() tea.Cmd {
 
 func (s *sessionDialogCmp) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	switch msg := msg.(type) {
-	case tea.KeyMsg:
+	case tea.KeyPressMsg:
 		switch {
 		case key.Matches(msg, sessionKeys.Up) || key.Matches(msg, sessionKeys.K):
 			if s.selectedIdx > 0 {
@@ -105,10 +107,10 @@ func (s *sessionDialogCmp) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	return s, nil
 }
 
-func (s *sessionDialogCmp) View() string {
+func (s *sessionDialogCmp) render() string {
 	t := theme.CurrentTheme()
 	baseStyle := styles.BaseStyle()
-	
+
 	if len(s.sessions) == 0 {
 		return baseStyle.Padding(1, 2).
 			Border(lipgloss.RoundedBorder()).
@@ -126,7 +128,9 @@ func (s *sessionDialogCmp) View() string {
 		}
 	}
 
-	maxWidth = max(30, min(maxWidth, s.width-15)) // Limit width to avoid overflow
+	if s.width > 0 {
+		maxWidth = max(30, min(maxWidth, s.width-15)) // Limit width to avoid overflow
+	}
 
 	// Limit height to avoid taking up too much screen space
 	maxVisibleSessions := min(10, len(s.sessions))
@@ -181,8 +185,17 @@ func (s *sessionDialogCmp) View() string {
 		Border(lipgloss.RoundedBorder()).
 		BorderBackground(t.Background()).
 		BorderForeground(t.TextMuted()).
-		Width(lipgloss.Width(content) + 4).
+		Width(lipgloss.Width(content) + 6).
 		Render(content)
+}
+
+func (s *sessionDialogCmp) View() tea.View {
+	return tea.NewView(s.render())
+}
+
+func (s *sessionDialogCmp) Draw(scr uv.Screen, area uv.Rectangle) *tea.Cursor {
+	layout.DrawCenter(scr, area, s.render())
+	return nil
 }
 
 func (s *sessionDialogCmp) BindingKeys() []key.Binding {

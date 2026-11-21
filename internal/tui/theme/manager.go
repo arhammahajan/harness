@@ -6,7 +6,6 @@ import (
 	"strings"
 	"sync"
 
-	"github.com/alecthomas/chroma/v2/styles"
 	"github.com/arhammahajan/harness/internal/config"
 	"github.com/arhammahajan/harness/internal/logging"
 )
@@ -23,6 +22,33 @@ type Manager struct {
 var globalManager = &Manager{
 	themes:      make(map[string]Theme),
 	currentName: "",
+}
+
+var (
+	listenersMu          sync.RWMutex
+	themeChangeListeners []func()
+)
+
+// OnThemeChange registers a callback invoked whenever the active theme or
+// dark/light background mode changes.
+func OnThemeChange(fn func()) {
+	if fn == nil {
+		return
+	}
+	listenersMu.Lock()
+	themeChangeListeners = append(themeChangeListeners, fn)
+	listenersMu.Unlock()
+}
+
+func notifyThemeChange() {
+	listenersMu.RLock()
+	listeners := make([]func(), len(themeChangeListeners))
+	copy(listeners, themeChangeListeners)
+	listenersMu.RUnlock()
+
+	for _, fn := range listeners {
+		fn()
+	}
 }
 
 // RegisterTheme adds a new theme to the registry.
@@ -43,10 +69,8 @@ func RegisterTheme(name string, theme Theme) {
 // Returns an error if the theme doesn't exist.
 func SetTheme(name string) error {
 	globalManager.mu.Lock()
-	defer globalManager.mu.Unlock()
-
-	delete(styles.Registry, "charm")
 	if _, exists := globalManager.themes[name]; !exists {
+		globalManager.mu.Unlock()
 		return fmt.Errorf("theme '%s' not found", name)
 	}
 
@@ -57,7 +81,9 @@ func SetTheme(name string) error {
 		// Log the error but don't fail the theme change
 		logging.Warn("Warning: Failed to update config file with new theme", "err", err)
 	}
+	globalManager.mu.Unlock()
 
+	notifyThemeChange()
 	return nil
 }
 

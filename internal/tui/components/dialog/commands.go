@@ -1,9 +1,10 @@
 package dialog
 
 import (
-	"github.com/charmbracelet/bubbles/key"
-	tea "github.com/charmbracelet/bubbletea"
-	"github.com/charmbracelet/lipgloss"
+	"charm.land/bubbles/v2/key"
+	tea "charm.land/bubbletea/v2"
+	"charm.land/lipgloss/v2"
+	uv "github.com/charmbracelet/ultraviolet"
 	utilComponents "github.com/arhammahajan/harness/internal/tui/components/util"
 	"github.com/arhammahajan/harness/internal/tui/layout"
 	"github.com/arhammahajan/harness/internal/tui/styles"
@@ -58,6 +59,7 @@ type CloseCommandDialogMsg struct{}
 type CommandDialog interface {
 	tea.Model
 	layout.Bindings
+	layout.Drawable
 	SetCommands(commands []Command)
 }
 
@@ -90,7 +92,7 @@ func (c *commandDialogCmp) Init() tea.Cmd {
 func (c *commandDialogCmp) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	var cmds []tea.Cmd
 	switch msg := msg.(type) {
-	case tea.KeyMsg:
+	case tea.KeyPressMsg:
 		switch {
 		case key.Matches(msg, commandKeys.Enter):
 			selectedItem, idx := c.listView.GetSelectedItem()
@@ -114,7 +116,7 @@ func (c *commandDialogCmp) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	return c, tea.Batch(cmds...)
 }
 
-func (c *commandDialogCmp) View() string {
+func (c *commandDialogCmp) render() string {
 	t := theme.CurrentTheme()
 	baseStyle := styles.BaseStyle()
 
@@ -146,7 +148,7 @@ func (c *commandDialogCmp) View() string {
 		lipgloss.Left,
 		title,
 		baseStyle.Width(maxWidth).Render(""),
-		baseStyle.Width(maxWidth).Render(c.listView.View()),
+		baseStyle.Width(maxWidth).Render(c.listView.Render()),
 		baseStyle.Width(maxWidth).Render(""),
 	)
 
@@ -154,8 +156,17 @@ func (c *commandDialogCmp) View() string {
 		Border(lipgloss.RoundedBorder()).
 		BorderBackground(t.Background()).
 		BorderForeground(t.TextMuted()).
-		Width(lipgloss.Width(content) + 4).
+		Width(lipgloss.Width(content) + 6).
 		Render(content)
+}
+
+func (c *commandDialogCmp) View() tea.View {
+	return tea.NewView(c.render())
+}
+
+func (c *commandDialogCmp) Draw(scr uv.Screen, area uv.Rectangle) *tea.Cursor {
+	layout.DrawCenter(scr, area, c.render())
+	return nil
 }
 
 func (c *commandDialogCmp) BindingKeys() []key.Binding {

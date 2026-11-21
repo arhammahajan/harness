@@ -5,9 +5,10 @@ import (
 	"slices"
 	"strings"
 
-	"github.com/charmbracelet/bubbles/key"
-	tea "github.com/charmbracelet/bubbletea"
-	"github.com/charmbracelet/lipgloss"
+	"charm.land/bubbles/v2/key"
+	tea "charm.land/bubbletea/v2"
+	"charm.land/lipgloss/v2"
+	uv "github.com/charmbracelet/ultraviolet"
 	"github.com/arhammahajan/harness/internal/config"
 	"github.com/arhammahajan/harness/internal/llm/models"
 	"github.com/arhammahajan/harness/internal/tui/layout"
@@ -26,13 +27,14 @@ type ModelSelectedMsg struct {
 	Model models.Model
 }
 
-// CloseModelDialogMsg is sent when a model is selected
+// CloseModelDialogMsg is sent when a model dialog is closed
 type CloseModelDialogMsg struct{}
 
 // ModelDialog interface for the model selection dialog
 type ModelDialog interface {
 	tea.Model
 	layout.Bindings
+	layout.Drawable
 }
 
 type modelDialogCmp struct {
@@ -111,7 +113,7 @@ func (m *modelDialogCmp) Init() tea.Cmd {
 
 func (m *modelDialogCmp) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	switch msg := msg.(type) {
-	case tea.KeyMsg:
+	case tea.KeyPressMsg:
 		switch {
 		case key.Matches(msg, modelKeys.Up) || key.Matches(msg, modelKeys.K):
 			m.moveSelectionUp()
@@ -126,8 +128,10 @@ func (m *modelDialogCmp) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				m.switchProvider(1)
 			}
 		case key.Matches(msg, modelKeys.Enter):
-			util.ReportInfo(fmt.Sprintf("selected model: %s", m.models[m.selectedIdx].Name))
-			return m, util.CmdHandler(ModelSelectedMsg{Model: m.models[m.selectedIdx]})
+			if len(m.models) > 0 && m.selectedIdx >= 0 && m.selectedIdx < len(m.models) {
+				util.ReportInfo(fmt.Sprintf("selected model: %s", m.models[m.selectedIdx].Name))
+				return m, util.CmdHandler(ModelSelectedMsg{Model: m.models[m.selectedIdx]})
+			}
 		case key.Matches(msg, modelKeys.Escape):
 			return m, util.CmdHandler(CloseModelDialogMsg{})
 		}
@@ -141,6 +145,9 @@ func (m *modelDialogCmp) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 // moveSelectionUp moves the selection up or wraps to bottom
 func (m *modelDialogCmp) moveSelectionUp() {
+	if len(m.models) == 0 {
+		return
+	}
 	if m.selectedIdx > 0 {
 		m.selectedIdx--
 	} else {
@@ -156,6 +163,9 @@ func (m *modelDialogCmp) moveSelectionUp() {
 
 // moveSelectionDown moves the selection down or wraps to top
 func (m *modelDialogCmp) moveSelectionDown() {
+	if len(m.models) == 0 {
+		return
+	}
 	if m.selectedIdx < len(m.models)-1 {
 		m.selectedIdx++
 	} else {
@@ -170,6 +180,9 @@ func (m *modelDialogCmp) moveSelectionDown() {
 }
 
 func (m *modelDialogCmp) switchProvider(offset int) {
+	if len(m.availableProviders) == 0 {
+		return
+	}
 	newOffset := m.hScrollOffset + offset
 
 	// Ensure we stay within bounds
@@ -185,22 +198,26 @@ func (m *modelDialogCmp) switchProvider(offset int) {
 	m.setupModelsForProvider(m.provider)
 }
 
-func (m *modelDialogCmp) View() string {
+func (m *modelDialogCmp) render() string {
 	t := theme.CurrentTheme()
 	baseStyle := styles.BaseStyle()
 
 	// Capitalize first letter of provider name
-	providerName := strings.ToUpper(string(m.provider)[:1]) + string(m.provider[1:])
+	titleText := "Select Model"
+	if len(m.provider) > 0 {
+		providerName := strings.ToUpper(string(m.provider)[:1]) + string(m.provider[1:])
+		titleText = fmt.Sprintf("Select %s Model", providerName)
+	}
 	title := baseStyle.
 		Foreground(t.Primary()).
 		Bold(true).
 		Width(maxDialogWidth).
 		Padding(0, 0, 1).
-		Render(fmt.Sprintf("Select %s Model", providerName))
+		Render(titleText)
 
 	// Render visible models
 	endIdx := min(m.scrollOffset+numVisibleModels, len(m.models))
-	modelItems := make([]string, 0, endIdx-m.scrollOffset)
+	modelItems := make([]string, 0, max(0, endIdx-m.scrollOffset))
 
 	for i := m.scrollOffset; i < endIdx; i++ {
 		itemStyle := baseStyle.Width(maxDialogWidth)
@@ -209,6 +226,10 @@ func (m *modelDialogCmp) View() string {
 				Foreground(t.Background()).Bold(true)
 		}
 		modelItems = append(modelItems, itemStyle.Render(m.models[i].Name))
+	}
+
+	if len(modelItems) == 0 {
+		modelItems = append(modelItems, baseStyle.Foreground(t.TextMuted()).Width(maxDialogWidth).Render("No models available"))
 	}
 
 	scrollIndicator := m.getScrollIndicators(maxDialogWidth)
@@ -224,8 +245,17 @@ func (m *modelDialogCmp) View() string {
 		Border(lipgloss.RoundedBorder()).
 		BorderBackground(t.Background()).
 		BorderForeground(t.TextMuted()).
-		Width(lipgloss.Width(content) + 4).
+		Width(lipgloss.Width(content) + 6).
 		Render(content)
+}
+
+func (m *modelDialogCmp) View() tea.View {
+	return tea.NewView(m.render())
+}
+
+func (m *modelDialogCmp) Draw(scr uv.Screen, area uv.Rectangle) *tea.Cursor {
+	layout.DrawCenter(scr, area, m.render())
+	return nil
 }
 
 func (m *modelDialogCmp) getScrollIndicators(maxWidth int) string {
@@ -270,6 +300,9 @@ func (m *modelDialogCmp) BindingKeys() []key.Binding {
 
 func (m *modelDialogCmp) setupModels() {
 	cfg := config.Get()
+	if cfg == nil {
+		return
+	}
 	modelInfo := GetSelectedModel(cfg)
 	m.availableProviders = getEnabledProviders(cfg)
 	m.hScrollPossible = len(m.availableProviders) > 1
@@ -281,7 +314,9 @@ func (m *modelDialogCmp) setupModels() {
 }
 
 func GetSelectedModel(cfg *config.Config) models.Model {
-
+	if cfg == nil {
+		return models.Model{}
+	}
 	agentCfg := cfg.Agents[config.AgentCoder]
 	selectedModelId := agentCfg.Model
 	return models.SupportedModels[selectedModelId]
@@ -324,8 +359,11 @@ func findProviderIndex(providers []models.ModelProvider, provider models.ModelPr
 
 func (m *modelDialogCmp) setupModelsForProvider(provider models.ModelProvider) {
 	cfg := config.Get()
-	agentCfg := cfg.Agents[config.AgentCoder]
-	selectedModelId := agentCfg.Model
+	var selectedModelId models.ModelID
+	if cfg != nil {
+		agentCfg := cfg.Agents[config.AgentCoder]
+		selectedModelId = agentCfg.Model
+	}
 
 	m.provider = provider
 	m.models = getModelsForProvider(provider)

@@ -1,10 +1,11 @@
 package dialog
 
 import (
-	"github.com/charmbracelet/bubbles/key"
-	"github.com/charmbracelet/bubbles/textarea"
-	tea "github.com/charmbracelet/bubbletea"
-	"github.com/charmbracelet/lipgloss"
+	"charm.land/bubbles/v2/key"
+	"charm.land/bubbles/v2/textarea"
+	tea "charm.land/bubbletea/v2"
+	"charm.land/lipgloss/v2"
+	uv "github.com/charmbracelet/ultraviolet"
 	"github.com/arhammahajan/harness/internal/logging"
 	utilComponents "github.com/arhammahajan/harness/internal/tui/components/util"
 	"github.com/arhammahajan/harness/internal/tui/layout"
@@ -79,6 +80,7 @@ type CompletionDialogCloseMsg struct{}
 type CompletionDialog interface {
 	tea.Model
 	layout.Bindings
+	layout.Drawable
 	SetWidth(width int)
 }
 
@@ -136,17 +138,14 @@ func (c *completionDialogCmp) close() tea.Cmd {
 func (c *completionDialogCmp) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	var cmds []tea.Cmd
 	switch msg := msg.(type) {
-	case tea.KeyMsg:
+	case tea.KeyPressMsg:
 		if c.pseudoSearchTextArea.Focused() {
-
 			if !key.Matches(msg, completionDialogKeys.Complete) {
-
 				var cmd tea.Cmd
 				c.pseudoSearchTextArea, cmd = c.pseudoSearchTextArea.Update(msg)
 				cmds = append(cmds, cmd)
 
-				var query string
-				query = c.pseudoSearchTextArea.Value()
+				query := c.pseudoSearchTextArea.Value()
 				if query != "" {
 					query = query[1:]
 				}
@@ -204,7 +203,7 @@ func (c *completionDialogCmp) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	return c, tea.Batch(cmds...)
 }
 
-func (c *completionDialogCmp) View() string {
+func (c *completionDialogCmp) render() string {
 	t := theme.CurrentTheme()
 	baseStyle := styles.BaseStyle()
 
@@ -221,15 +220,34 @@ func (c *completionDialogCmp) View() string {
 
 	c.listView.SetMaxWidth(maxWidth)
 
-	return baseStyle.Padding(0, 0).
+	dialogStyle := baseStyle.Padding(0, 0).
 		Border(lipgloss.NormalBorder()).
 		BorderBottom(false).
 		BorderRight(false).
 		BorderLeft(false).
 		BorderBackground(t.Background()).
-		BorderForeground(t.TextMuted()).
-		Width(c.width).
-		Render(c.listView.View())
+		BorderForeground(t.TextMuted())
+	if c.width > 0 {
+		dialogStyle = dialogStyle.Width(c.width)
+	}
+	return dialogStyle.Render(c.listView.Render())
+}
+
+func (c *completionDialogCmp) View() tea.View {
+	return tea.NewView(c.render())
+}
+
+func (c *completionDialogCmp) Draw(scr uv.Screen, area uv.Rectangle) *tea.Cursor {
+	if c.width == 0 && area.Dx() > 0 {
+		c.width = area.Dx()
+	}
+	view := c.render()
+	width, height := lipgloss.Size(view)
+	width = min(width, area.Dx())
+	height = min(height, area.Dy())
+	rect := layout.BottomLeftRect(area, width, height)
+	layout.DrawAt(scr, rect, view)
+	return nil
 }
 
 func (c *completionDialogCmp) SetWidth(width int) {
@@ -242,6 +260,7 @@ func (c *completionDialogCmp) BindingKeys() []key.Binding {
 
 func NewCompletionDialogCmp(completionProvider CompletionProvider) CompletionDialog {
 	ti := textarea.New()
+	ti.SetVirtualCursor(false)
 
 	items, err := completionProvider.GetChildEntries("")
 	if err != nil {
