@@ -10,9 +10,9 @@ import (
 	"sort"
 	"strings"
 
-	"github.com/opencode-ai/opencode/internal/config"
-	"github.com/opencode-ai/opencode/internal/fileutil"
-	"github.com/opencode-ai/opencode/internal/logging"
+	"github.com/arhammahajan/harness/internal/config"
+	"github.com/arhammahajan/harness/internal/fileutil"
+	"github.com/arhammahajan/harness/internal/logging"
 )
 
 const (

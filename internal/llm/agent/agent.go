@@ -8,16 +8,16 @@ import (
 	"sync"
 	"time"
 
-	"github.com/opencode-ai/opencode/internal/config"
-	"github.com/opencode-ai/opencode/internal/llm/models"
-	"github.com/opencode-ai/opencode/internal/llm/prompt"
-	"github.com/opencode-ai/opencode/internal/llm/provider"
-	"github.com/opencode-ai/opencode/internal/llm/tools"
-	"github.com/opencode-ai/opencode/internal/logging"
-	"github.com/opencode-ai/opencode/internal/message"
-	"github.com/opencode-ai/opencode/internal/permission"
-	"github.com/opencode-ai/opencode/internal/pubsub"
-	"github.com/opencode-ai/opencode/internal/session"
+	"github.com/arhammahajan/harness/internal/config"
+	"github.com/arhammahajan/harness/internal/llm/models"
+	"github.com/arhammahajan/harness/internal/llm/prompt"
+	"github.com/arhammahajan/harness/internal/llm/provider"
+	"github.com/arhammahajan/harness/internal/llm/tools"
+	"github.com/arhammahajan/harness/internal/logging"
+	"github.com/arhammahajan/harness/internal/message"
+	"github.com/arhammahajan/harness/internal/permission"
+	"github.com/arhammahajan/harness/internal/pubsub"
+	"github.com/arhammahajan/harness/internal/session"
 )
 
 // Common errors

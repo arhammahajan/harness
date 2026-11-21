@@ -7,16 +7,16 @@ import (
 
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
-	"github.com/opencode-ai/opencode/internal/config"
-	"github.com/opencode-ai/opencode/internal/llm/models"
-	"github.com/opencode-ai/opencode/internal/lsp"
-	"github.com/opencode-ai/opencode/internal/lsp/protocol"
-	"github.com/opencode-ai/opencode/internal/pubsub"
-	"github.com/opencode-ai/opencode/internal/session"
-	"github.com/opencode-ai/opencode/internal/tui/components/chat"
-	"github.com/opencode-ai/opencode/internal/tui/styles"
-	"github.com/opencode-ai/opencode/internal/tui/theme"
-	"github.com/opencode-ai/opencode/internal/tui/util"
+	"github.com/arhammahajan/harness/internal/config"
+	"github.com/arhammahajan/harness/internal/llm/models"
+	"github.com/arhammahajan/harness/internal/lsp"
+	"github.com/arhammahajan/harness/internal/lsp/protocol"
+	"github.com/arhammahajan/harness/internal/pubsub"
+	"github.com/arhammahajan/harness/internal/session"
+	"github.com/arhammahajan/harness/internal/tui/components/chat"
+	"github.com/arhammahajan/harness/internal/tui/styles"
+	"github.com/arhammahajan/harness/internal/tui/theme"
+	"github.com/arhammahajan/harness/internal/tui/util"
 )
 
 type StatusCmp interface {

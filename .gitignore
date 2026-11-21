@@ -41,7 +41,7 @@ Thumbs.db
 .env
 .env.local
 
-.opencode/
+.harness/
 
-opencode
-opencode.md
+harness
+harness.md

@@ -9,12 +9,12 @@ import (
 	"strings"
 	"time"
 
-	"github.com/opencode-ai/opencode/internal/config"
-	"github.com/opencode-ai/opencode/internal/diff"
-	"github.com/opencode-ai/opencode/internal/history"
-	"github.com/opencode-ai/opencode/internal/logging"
-	"github.com/opencode-ai/opencode/internal/lsp"
-	"github.com/opencode-ai/opencode/internal/permission"
+	"github.com/arhammahajan/harness/internal/config"
+	"github.com/arhammahajan/harness/internal/diff"
+	"github.com/arhammahajan/harness/internal/history"
+	"github.com/arhammahajan/harness/internal/logging"
+	"github.com/arhammahajan/harness/internal/lsp"
+	"github.com/arhammahajan/harness/internal/permission"
 )
 
 type EditParams struct {

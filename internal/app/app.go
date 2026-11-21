@@ -9,17 +9,17 @@ import (
 	"sync"
 	"time"
 
-	"github.com/opencode-ai/opencode/internal/config"
-	"github.com/opencode-ai/opencode/internal/db"
-	"github.com/opencode-ai/opencode/internal/format"
-	"github.com/opencode-ai/opencode/internal/history"
-	"github.com/opencode-ai/opencode/internal/llm/agent"
-	"github.com/opencode-ai/opencode/internal/logging"
-	"github.com/opencode-ai/opencode/internal/lsp"
-	"github.com/opencode-ai/opencode/internal/message"
-	"github.com/opencode-ai/opencode/internal/permission"
-	"github.com/opencode-ai/opencode/internal/session"
-	"github.com/opencode-ai/opencode/internal/tui/theme"
+	"github.com/arhammahajan/harness/internal/config"
+	"github.com/arhammahajan/harness/internal/db"
+	"github.com/arhammahajan/harness/internal/format"
+	"github.com/arhammahajan/harness/internal/history"
+	"github.com/arhammahajan/harness/internal/llm/agent"
+	"github.com/arhammahajan/harness/internal/logging"
+	"github.com/arhammahajan/harness/internal/lsp"
+	"github.com/arhammahajan/harness/internal/message"
+	"github.com/arhammahajan/harness/internal/permission"
+	"github.com/arhammahajan/harness/internal/session"
+	"github.com/arhammahajan/harness/internal/tui/theme"
 )
 
 type App struct {

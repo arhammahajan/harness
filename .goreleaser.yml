@@ -1,5 +1,5 @@
 version: 2
-project_name: opencode
+project_name: harness
 before:
   hooks:
 builds:
@@ -12,13 +12,13 @@ builds:
       - amd64
       - arm64
     ldflags:
-      - -s -w -X github.com/opencode-ai/opencode/internal/version.Version={{.Version}}
+      - -s -w -X github.com/arhammahajan/harness/internal/version.Version={{.Version}}
     main: ./main.go
 
 archives:
   - format: tar.gz
     name_template: >-
-      opencode-
+      harness-
       {{- if eq .Os "darwin" }}mac-
       {{- else if eq .Os "windows" }}windows-
       {{- else if eq .Os "linux" }}linux-{{end}}
@@ -34,23 +34,23 @@ checksum:
 snapshot:
   name_template: "0.0.0-{{ .Timestamp }}"
 aurs:
-  - name: opencode-ai
-    homepage: "https://github.com/opencode-ai/opencode"
+  - name: harness
+    homepage: "https://github.com/arhammahajan/harness"
     description: "terminal based agent that can build anything"
     maintainers:
       - "kujtimiihoxha <kujtimii.h@gmail.com>"
     license: "MIT"
     private_key: "{{ .Env.AUR_KEY }}"
-    git_url: "ssh://aur@aur.archlinux.org/opencode-ai-bin.git"
+    git_url: "ssh://aur@aur.archlinux.org/harness-bin.git"
     provides:
-      - opencode
+      - harness
     conflicts:
-      - opencode
+      - harness
     package: |-
-      install -Dm755 ./opencode "${pkgdir}/usr/bin/opencode"
+      install -Dm755 ./harness "${pkgdir}/usr/bin/harness"
 brews:
   - repository:
-      owner: opencode-ai
+      owner: arhammahajan
       name: homebrew-tap
 nfpms:
   - maintainer: kujtimiihoxha

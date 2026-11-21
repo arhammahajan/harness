@@ -8,12 +8,12 @@ import (
 	"github.com/charmbracelet/bubbles/key"
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
-	"github.com/opencode-ai/opencode/internal/config"
-	"github.com/opencode-ai/opencode/internal/llm/models"
-	"github.com/opencode-ai/opencode/internal/tui/layout"
-	"github.com/opencode-ai/opencode/internal/tui/styles"
-	"github.com/opencode-ai/opencode/internal/tui/theme"
-	"github.com/opencode-ai/opencode/internal/tui/util"
+	"github.com/arhammahajan/harness/internal/config"
+	"github.com/arhammahajan/harness/internal/llm/models"
+	"github.com/arhammahajan/harness/internal/tui/layout"
+	"github.com/arhammahajan/harness/internal/tui/styles"
+	"github.com/arhammahajan/harness/internal/tui/theme"
+	"github.com/arhammahajan/harness/internal/tui/util"
 )
 
 const (
