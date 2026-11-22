@@ -1,14 +1,11 @@
 package main
 
 import (
+	"os"
+
 	"github.com/arhammahajan/harness/cmd"
-	"github.com/arhammahajan/harness/internal/logging"
 )
 
 func main() {
-	defer logging.RecoverPanic("main", func() {
-		logging.ErrorPersist("Application terminated due to unhandled panic")
-	})
-
-	cmd.Execute()
+	os.Exit(cmd.Run(os.Args[1:]))
 }
