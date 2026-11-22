@@ -282,10 +282,21 @@ func setupSubscriptions(app *app.App, parentCtx context.Context) (chan tea.Msg, 
 }
 
 func Execute() {
-	err := rootCmd.Execute()
-	if err != nil {
-		os.Exit(1)
+	if code := executeCodingAgent(os.Args[1:]); code != 0 {
+		os.Exit(code)
 	}
+}
+
+func executeCodingAgent(args []string) int {
+	defer logging.RecoverPanic("main", func() {
+		logging.ErrorPersist("Application terminated due to unhandled panic")
+	})
+
+	rootCmd.SetArgs(args)
+	if err := rootCmd.Execute(); err != nil {
+		return 1
+	}
+	return 0
 }
 
 func init() {
