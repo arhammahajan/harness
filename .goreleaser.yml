@@ -33,27 +33,12 @@ checksum:
   name_template: "checksums.txt"
 snapshot:
   name_template: "0.0.0-{{ .Timestamp }}"
-aurs:
-  - name: harness
-    homepage: "https://github.com/arhammahajan/harness"
-    description: "terminal based agent that can build anything"
-    maintainers:
-      - "kujtimiihoxha <kujtimii.h@gmail.com>"
-    license: "MIT"
-    private_key: "{{ .Env.AUR_KEY }}"
-    git_url: "ssh://aur@aur.archlinux.org/harness-bin.git"
-    provides:
-      - harness
-    conflicts:
-      - harness
-    package: |-
-      install -Dm755 ./harness "${pkgdir}/usr/bin/harness"
 brews:
   - repository:
       owner: arhammahajan
       name: homebrew-tap
 nfpms:
-  - maintainer: kujtimiihoxha
+  - maintainer: arhammahajan
     description: terminal based agent that can build anything
     formats:
       - deb

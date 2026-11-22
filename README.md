@@ -1,21 +1,10 @@
-# Archived: Project has Moved
-
-This repository is no longer maintained and has been archived for provenance.
-
-The project has continued under the name [Crush][crush], developed by the original author and the Charm team.
-
-Please follow [Crush][crush] for ongoing development.
-
-[crush]: https://github.com/charmbracelet/crush
-
-
 # ⌬ Harness
 
 <p align="center"><img src="https://github.com/user-attachments/assets/9ae61ef6-70e5-4876-bc45-5bcb4e52c714" width="800"></p>
 
 > **⚠️ Early Development Notice:** This project is in early development and is not yet ready for production use. Features may change, break, or be incomplete. Use at your own risk.
 
-A powerful terminal-based AI assistant for developers, providing intelligent coding assistance directly in your terminal.
+A terminal-based AI coding assistant TUI for developers, providing intelligent coding assistance directly in your terminal.
 
 ## Overview
 
