@@ -1,92 +1,168 @@
 package chat
 
 import (
-	"context"
+	"encoding/binary"
 	"encoding/json"
 	"fmt"
+	"hash/fnv"
 	"path/filepath"
 	"strings"
 	"time"
 
-	"github.com/charmbracelet/lipgloss"
+	"charm.land/lipgloss/v2"
 	"github.com/charmbracelet/x/ansi"
-	"github.com/arhammahajan/harness/internal/config"
 	"github.com/arhammahajan/harness/internal/diff"
 	"github.com/arhammahajan/harness/internal/llm/agent"
 	"github.com/arhammahajan/harness/internal/llm/models"
 	"github.com/arhammahajan/harness/internal/llm/tools"
 	"github.com/arhammahajan/harness/internal/message"
+	"github.com/arhammahajan/harness/internal/tui/list"
+	"github.com/arhammahajan/harness/internal/tui/markdown"
 	"github.com/arhammahajan/harness/internal/tui/styles"
 	"github.com/arhammahajan/harness/internal/tui/theme"
 )
 
-type uiMessageType int
+const maxResultHeight = 10
 
-const (
-	userMessageType uiMessageType = iota
-	assistantMessageType
-	toolMessageType
-
-	maxResultHeight = 10
-)
-
-type uiMessage struct {
-	ID          string
-	messageType uiMessageType
-	position    int
-	height      int
-	content     string
+// MessageItem represents a chat message or tool call item rendered inside the
+// virtualized [list.List].
+type MessageItem interface {
+	list.Item
+	ID() string
+	ClearCache()
 }
 
-func toMarkdown(content string, focused bool, width int) string {
-	r := styles.GetMarkdownRenderer(width)
-	rendered, _ := r.Render(content)
-	return rendered
+// assistantSection is a per-section render cache for AssistantMessageItem.
+// Each section (thinking, content) carries its own width + content hash +
+// metadata key so streaming body content never invalidates the cached thinking
+// section.
+type assistantSection struct {
+	width   int
+	srcHash uint64
+	extra   uint64
+	out     string
+	valid   bool
+	hits    int
+	misses  int
 }
 
-func renderMessage(msg string, isUser bool, isFocused bool, width int, info ...string) string {
+func (s *assistantSection) hit(width int, srcHash, extra uint64) bool {
+	return s.valid && s.width == width && s.srcHash == srcHash && s.extra == extra
+}
+
+func (s *assistantSection) store(width int, srcHash, extra uint64, out string) {
+	s.width = width
+	s.srcHash = srcHash
+	s.extra = extra
+	s.out = out
+	s.valid = true
+}
+
+func (s *assistantSection) reset() {
+	s.width = 0
+	s.srcHash = 0
+	s.extra = 0
+	s.out = ""
+	s.valid = false
+}
+
+func fnv64(s string) uint64 {
+	h := fnv.New64a()
+	_, _ = h.Write([]byte(s))
+	return h.Sum64()
+}
+
+func fnvFields(fields ...[]byte) uint64 {
+	h := fnv.New64a()
+	var lenBuf [8]byte
+	for _, f := range fields {
+		binary.LittleEndian.PutUint64(lenBuf[:], uint64(len(f)))
+		_, _ = h.Write(lenBuf[:])
+		_, _ = h.Write(f)
+	}
+	return h.Sum64()
+}
+
+func toMarkdown(content string, width int) string {
+	r := styles.GetMarkdownRenderer(max(1, width))
+	if r == nil {
+		return content
+	}
+	mu := styles.LockMarkdownRenderer(r)
+	mu.Lock()
+	rendered, err := r.Render(content)
+	mu.Unlock()
+	if err != nil {
+		return content
+	}
+	return strings.TrimSuffix(rendered, "\n")
+}
+
+// UserMessageItem renders a user chat message with Harness's left thick border
+// and attachment badges, memoized by width.
+type UserMessageItem struct {
+	*list.Versioned
+
+	msg       message.Message
+	stateHash uint64
+
+	cachedWidth  int
+	cachedRender string
+}
+
+var _ MessageItem = (*UserMessageItem)(nil)
+
+// NewUserMessageItem constructs a versioned, cached user message item.
+func NewUserMessageItem(msg message.Message) *UserMessageItem {
+	return &UserMessageItem{
+		Versioned: list.NewVersioned(),
+		msg:       msg,
+		stateHash: userStateHash(msg),
+	}
+}
+
+func (u *UserMessageItem) ID() string {
+	return u.msg.ID
+}
+
+// SetMessage updates the underlying user message and bumps the version only
+// when rendered content changes.
+func (u *UserMessageItem) SetMessage(msg message.Message) {
+	newHash := userStateHash(msg)
+	if newHash == u.stateHash {
+		return
+	}
+	u.msg = msg
+	u.stateHash = newHash
+	u.cachedWidth = 0
+	u.cachedRender = ""
+	u.Bump()
+}
+
+// ClearCache drops the cached rendered string and bumps the version.
+func (u *UserMessageItem) ClearCache() {
+	u.cachedWidth = 0
+	u.cachedRender = ""
+	u.Bump()
+}
+
+// Render renders the user message at width, returning the cached output on a
+// width hit.
+func (u *UserMessageItem) Render(width int) string {
+	width = max(1, width)
+	if u.cachedRender != "" && u.cachedWidth == width {
+		return u.cachedRender
+	}
+
 	t := theme.CurrentTheme()
+	innerWidth := max(1, width-1)
 
-	style := styles.BaseStyle().
-		Width(width - 1).
-		BorderLeft(true).
-		Foreground(t.TextMuted()).
-		BorderForeground(t.Primary()).
-		BorderStyle(lipgloss.ThickBorder())
-
-	if isUser {
-		style = style.BorderForeground(t.Secondary())
-	}
-
-	// Apply markdown formatting and handle background color
-	parts := []string{
-		styles.ForceReplaceBackgroundWithLipgloss(toMarkdown(msg, isFocused, width), t.Background()),
-	}
-
-	// Remove newline at the end
-	parts[0] = strings.TrimSuffix(parts[0], "\n")
-	if len(info) > 0 {
-		parts = append(parts, info...)
-	}
-
-	rendered := style.Render(
-		lipgloss.JoinVertical(
-			lipgloss.Left,
-			parts...,
-		),
-	)
-
-	return rendered
-}
-
-func renderUserMessage(msg message.Message, isFocused bool, width int, position int) uiMessage {
 	var styledAttachments []string
-	t := theme.CurrentTheme()
 	attachmentStyles := styles.BaseStyle().
 		MarginLeft(1).
 		Background(t.TextMuted()).
 		Foreground(t.Text())
-	for _, attachment := range msg.BinaryContent() {
+	for _, attachment := range u.msg.BinaryContent() {
 		file := filepath.Base(attachment.Path)
 		var filename string
 		if len(file) > 10 {
@@ -96,124 +172,438 @@ func renderUserMessage(msg message.Message, isFocused bool, width int, position 
 		}
 		styledAttachments = append(styledAttachments, attachmentStyles.Render(filename))
 	}
-	content := ""
+
+	parts := []string{
+		toMarkdown(u.msg.Content().String(), innerWidth),
+	}
 	if len(styledAttachments) > 0 {
-		attachmentContent := styles.BaseStyle().Width(width).Render(lipgloss.JoinHorizontal(lipgloss.Left, styledAttachments...))
-		content = renderMessage(msg.Content().String(), true, isFocused, width, attachmentContent)
-	} else {
-		content = renderMessage(msg.Content().String(), true, isFocused, width)
+		attachmentContent := styles.BaseStyle().
+			Width(innerWidth).
+			Render(lipgloss.JoinHorizontal(lipgloss.Top, styledAttachments...))
+		parts = append(parts, attachmentContent)
 	}
-	userMsg := uiMessage{
-		ID:          msg.ID,
-		messageType: userMessageType,
-		position:    position,
-		height:      lipgloss.Height(content),
-		content:     content,
-	}
-	return userMsg
+
+	style := styles.BaseStyle().
+		Width(width).
+		BorderLeft(true).
+		Foreground(t.TextMuted()).
+		BorderForeground(t.Secondary()).
+		BorderStyle(lipgloss.ThickBorder())
+
+	rendered := style.Render(
+		lipgloss.JoinVertical(
+			lipgloss.Left,
+			parts...,
+		),
+	)
+
+	u.cachedWidth = width
+	u.cachedRender = rendered
+	return rendered
 }
 
-// Returns multiple uiMessages because of the tool calls
-func renderAssistantMessage(
-	msg message.Message,
-	msgIndex int,
-	allMessages []message.Message, // we need this to get tool results and the user message
-	messagesService message.Service, // We need this to get the task tool messages
-	focusedUIMessageId string,
-	isSummary bool,
-	width int,
-	position int,
-) []uiMessage {
-	messages := []uiMessage{}
-	content := msg.Content().String()
-	thinking := msg.IsThinking()
-	thinkingContent := msg.ReasoningContent().Thinking
-	finished := msg.IsFinished()
-	finishData := msg.FinishPart()
-	info := []string{}
+func userStateHash(msg message.Message) uint64 {
+	fields := [][]byte{
+		[]byte(msg.ID),
+		[]byte(msg.Content().String()),
+	}
+	for _, b := range msg.BinaryContent() {
+		fields = append(fields, []byte(b.Path), []byte(b.MIMEType))
+	}
+	return fnvFields(fields...)
+}
+
+// AssistantMessageItem renders an assistant message with per-section render
+// caches and incremental StreamingMarkdown caches for both content and
+// thinking sections.
+type AssistantMessageItem struct {
+	*list.Versioned
+
+	msg       message.Message
+	isSummary bool
+	stateHash uint64
+
+	// Incremental FNV-64a hash state for thinking text so long reasoning traces
+	// avoid O(N) re-hashing on every streaming flush.
+	thinkingHash       uint64
+	thinkingHashLen    int
+	thinkingHashSample string
+
+	// Per-section caches: streaming content never invalidates thinkingSec.
+	thinkingSec assistantSection
+	contentSec  assistantSection
+
+	// Stable-prefix streaming markdown renderers for O(delta) streaming.
+	streamingContent  markdown.StreamingMarkdown
+	streamingThinking markdown.StreamingMarkdown
+
+	// Outer bordered-message cache keyed by (width, stateHash).
+	cachedWidth  int
+	cachedHash   uint64
+	cachedRender string
+}
+
+var _ MessageItem = (*AssistantMessageItem)(nil)
+
+// NewAssistantMessageItem constructs a versioned, cached assistant message item.
+func NewAssistantMessageItem(msg message.Message, isSummary bool) *AssistantMessageItem {
+	return &AssistantMessageItem{
+		Versioned: list.NewVersioned(),
+		msg:       msg,
+		isSummary: isSummary,
+		stateHash: assistantStateHash(msg, isSummary),
+	}
+}
+
+func (a *AssistantMessageItem) ID() string {
+	return a.msg.ID
+}
+
+// SetMessage updates the message in-place while preserving per-section caches
+// and StreamingMarkdown stable prefixes. Calls Bump() only when state changed.
+func (a *AssistantMessageItem) SetMessage(msg message.Message, isSummary bool) {
+	newHash := assistantStateHash(msg, isSummary)
+	if newHash == a.stateHash {
+		return
+	}
+	a.msg = msg
+	a.isSummary = isSummary
+	a.stateHash = newHash
+	a.cachedRender = ""
+	a.cachedWidth = 0
+	a.cachedHash = 0
+	a.Bump()
+}
+
+// ClearCache drops all per-section caches, StreamingMarkdown caches, and the
+// outer render cache, then bumps the version so the next draw re-renders with
+// fresh styles.
+func (a *AssistantMessageItem) ClearCache() {
+	a.thinkingSec.reset()
+	a.contentSec.reset()
+	a.streamingContent.Reset()
+	a.streamingThinking.Reset()
+	a.thinkingHash = 0
+	a.thinkingHashLen = 0
+	a.thinkingHashSample = ""
+	a.cachedRender = ""
+	a.cachedWidth = 0
+	a.cachedHash = 0
+	a.Bump()
+}
+
+// Render renders the assistant message at width using per-section caches and
+// incremental StreamingMarkdown rendering.
+func (a *AssistantMessageItem) Render(width int) string {
+	width = max(1, width)
+	if a.cachedRender != "" && a.cachedWidth == width && a.cachedHash == a.stateHash {
+		return a.cachedRender
+	}
 
 	t := theme.CurrentTheme()
 	baseStyle := styles.BaseStyle()
+	innerWidth := max(1, width-1)
 
-	// Add finish info if available
-	if finished {
+	content := a.msg.Content().String()
+	thinkingContent := a.msg.ReasoningContent().Thinking
+	finished := a.msg.IsFinished()
+	finishData := a.msg.FinishPart()
+
+	var parts []string
+	if thinkingContent != "" {
+		parts = append(parts, a.cachedThinking(innerWidth))
+	}
+
+	hasBody := content != "" || (finished && finishData != nil && finishData.Reason == message.FinishReasonEndTurn)
+	if hasBody {
+		parts = append(parts, a.cachedContent(innerWidth))
+	}
+
+	var info []string
+	if finished && finishData != nil {
+		modelName := models.SupportedModels[a.msg.Model].Name
+		if modelName == "" {
+			modelName = string(a.msg.Model)
+		}
 		switch finishData.Reason {
 		case message.FinishReasonEndTurn:
-			took := formatTimestampDiff(msg.CreatedAt, finishData.Time)
+			took := formatTimestampDiff(a.msg.CreatedAt, finishData.Time)
 			info = append(info, baseStyle.
-				Width(width-1).
+				Width(innerWidth).
 				Foreground(t.TextMuted()).
-				Render(fmt.Sprintf(" %s (%s)", models.SupportedModels[msg.Model].Name, took)),
+				Render(fmt.Sprintf(" %s (%s)", modelName, took)),
 			)
 		case message.FinishReasonCanceled:
 			info = append(info, baseStyle.
-				Width(width-1).
+				Width(innerWidth).
 				Foreground(t.TextMuted()).
-				Render(fmt.Sprintf(" %s (%s)", models.SupportedModels[msg.Model].Name, "canceled")),
+				Render(fmt.Sprintf(" %s (%s)", modelName, "canceled")),
 			)
 		case message.FinishReasonError:
 			info = append(info, baseStyle.
-				Width(width-1).
+				Width(innerWidth).
 				Foreground(t.TextMuted()).
-				Render(fmt.Sprintf(" %s (%s)", models.SupportedModels[msg.Model].Name, "error")),
+				Render(fmt.Sprintf(" %s (%s)", modelName, "error")),
 			)
 		case message.FinishReasonPermissionDenied:
 			info = append(info, baseStyle.
-				Width(width-1).
+				Width(innerWidth).
 				Foreground(t.TextMuted()).
-				Render(fmt.Sprintf(" %s (%s)", models.SupportedModels[msg.Model].Name, "permission denied")),
+				Render(fmt.Sprintf(" %s (%s)", modelName, "permission denied")),
 			)
 		}
 	}
-	if content != "" || (finished && finishData.Reason == message.FinishReasonEndTurn) {
-		if content == "" {
-			content = "*Finished without output*"
-		}
-		if isSummary {
-			info = append(info, baseStyle.Width(width-1).Foreground(t.TextMuted()).Render(" (summary)"))
-		}
-
-		content = renderMessage(content, false, true, width, info...)
-		messages = append(messages, uiMessage{
-			ID:          msg.ID,
-			messageType: assistantMessageType,
-			position:    position,
-			height:      lipgloss.Height(content),
-			content:     content,
-		})
-		position += messages[0].height
-		position++ // for the space
-	} else if thinking && thinkingContent != "" {
-		// Render the thinking content
-		content = renderMessage(thinkingContent, false, msg.ID == focusedUIMessageId, width)
-	}
-
-	for i, toolCall := range msg.ToolCalls() {
-		toolCallContent := renderToolMessage(
-			toolCall,
-			allMessages,
-			messagesService,
-			focusedUIMessageId,
-			false,
-			width,
-			i+1,
+	if hasBody && a.isSummary {
+		info = append(info, baseStyle.
+			Width(innerWidth).
+			Foreground(t.TextMuted()).
+			Render(" (summary)"),
 		)
-		messages = append(messages, toolCallContent)
-		position += toolCallContent.height
-		position++ // for the space
 	}
-	return messages
+
+	parts = append(parts, info...)
+
+	style := baseStyle.
+		Width(width).
+		BorderLeft(true).
+		Foreground(t.TextMuted()).
+		BorderForeground(t.Primary()).
+		BorderStyle(lipgloss.ThickBorder())
+
+	rendered := style.Render(
+		lipgloss.JoinVertical(
+			lipgloss.Left,
+			parts...,
+		),
+	)
+
+	a.cachedWidth = width
+	a.cachedHash = a.stateHash
+	a.cachedRender = rendered
+	return rendered
 }
 
-func findToolResponse(toolCallID string, futureMessages []message.Message) *message.ToolResult {
-	for _, msg := range futureMessages {
-		for _, result := range msg.ToolResults() {
-			if result.ToolCallID == toolCallID {
-				return &result
-			}
+func (a *AssistantMessageItem) thinkingHashIncremental(thinking string) uint64 {
+	sampleLen := min(len(thinking), 64)
+	if a.thinkingHashLen > 0 && len(thinking) >= a.thinkingHashLen &&
+		thinking[:sampleLen] == a.thinkingHashSample {
+		h := a.thinkingHash
+		for i := a.thinkingHashLen; i < len(thinking); i++ {
+			h ^= uint64(thinking[i])
+			h *= 1099511628211
+		}
+		a.thinkingHash = h
+		a.thinkingHashLen = len(thinking)
+		return h
+	}
+	h := fnv64(thinking)
+	a.thinkingHash = h
+	a.thinkingHashLen = len(thinking)
+	a.thinkingHashSample = thinking[:sampleLen]
+	return h
+}
+
+func (a *AssistantMessageItem) cachedThinking(width int) string {
+	thinking := a.msg.ReasoningContent().Thinking
+	srcHash := a.thinkingHashIncremental(thinking)
+	const extra uint64 = 0
+	if a.thinkingSec.hit(width, srcHash, extra) {
+		a.thinkingSec.hits++
+		return a.thinkingSec.out
+	}
+	a.thinkingSec.misses++
+	r := styles.GetMarkdownRenderer(max(1, width))
+	out := a.streamingThinking.Render(thinking, max(1, width), r)
+	a.thinkingSec.store(width, srcHash, extra, out)
+	return out
+}
+
+func (a *AssistantMessageItem) cachedContent(width int) string {
+	content := a.msg.Content().String()
+	fallback := uint64(0)
+	if content == "" {
+		content = "*Finished without output*"
+		fallback = 1
+	}
+	srcHash := fnv64(content)
+	if a.contentSec.hit(width, srcHash, fallback) {
+		a.contentSec.hits++
+		return a.contentSec.out
+	}
+	a.contentSec.misses++
+	r := styles.GetMarkdownRenderer(max(1, width))
+	out := a.streamingContent.Render(content, max(1, width), r)
+	a.contentSec.store(width, srcHash, fallback, out)
+	return out
+}
+
+func assistantStateHash(msg message.Message, isSummary bool) uint64 {
+	var flags [3]byte
+	if msg.IsThinking() {
+		flags[0] = 1
+	}
+	if msg.IsFinished() {
+		flags[1] = 1
+	}
+	if isSummary {
+		flags[2] = 1
+	}
+	var finishReason string
+	var finishTime [8]byte
+	if fp := msg.FinishPart(); fp != nil {
+		finishReason = string(fp.Reason)
+		binary.LittleEndian.PutUint64(finishTime[:], uint64(fp.Time))
+	}
+	var createdAt [8]byte
+	binary.LittleEndian.PutUint64(createdAt[:], uint64(msg.CreatedAt))
+
+	return fnvFields(
+		[]byte(msg.ID),
+		[]byte(msg.Model),
+		[]byte(msg.Content().String()),
+		[]byte(msg.ReasoningContent().Thinking),
+		flags[:],
+		[]byte(finishReason),
+		finishTime[:],
+		createdAt[:],
+	)
+}
+
+func shouldRenderAssistantMessage(msg message.Message) bool {
+	if msg.Content().String() != "" {
+		return true
+	}
+	if msg.ReasoningContent().Thinking != "" {
+		return true
+	}
+	if msg.IsFinished() {
+		if fp := msg.FinishPart(); fp != nil && fp.Reason != message.FinishReasonToolUse {
+			return true
 		}
 	}
-	return nil
+	return false
+}
+
+// ToolMessageItem renders a tool call and its result (plus any nested Task
+// sub-agent tool calls), cached by width and bumped only when tool state
+// changes.
+type ToolMessageItem struct {
+	*list.Versioned
+
+	toolCall message.ToolCall
+	result   *message.ToolResult
+	nested   []message.ToolCall
+
+	stateHash    uint64
+	cachedWidth  int
+	cachedRender string
+}
+
+var _ MessageItem = (*ToolMessageItem)(nil)
+
+// NewToolMessageItem constructs a versioned, cached tool call item.
+func NewToolMessageItem(tc message.ToolCall, result *message.ToolResult, nested []message.ToolCall) *ToolMessageItem {
+	var resCopy *message.ToolResult
+	if result != nil {
+		r := *result
+		resCopy = &r
+	}
+	var nestedCopy []message.ToolCall
+	if len(nested) > 0 {
+		nestedCopy = append([]message.ToolCall(nil), nested...)
+	}
+	return &ToolMessageItem{
+		Versioned: list.NewVersioned(),
+		toolCall:  tc,
+		result:    resCopy,
+		nested:    nestedCopy,
+		stateHash: toolStateHash(tc, resCopy, nestedCopy),
+	}
+}
+
+func (t *ToolMessageItem) ID() string {
+	return t.toolCall.ID
+}
+
+// SetToolCall updates the tool call, result, and nested tool calls. It clears
+// the render cache and calls Bump() only when the state changed.
+func (t *ToolMessageItem) SetToolCall(tc message.ToolCall, result *message.ToolResult, nested []message.ToolCall) {
+	newHash := toolStateHash(tc, result, nested)
+	if newHash == t.stateHash {
+		return
+	}
+	t.toolCall = tc
+	if result != nil {
+		r := *result
+		t.result = &r
+	} else {
+		t.result = nil
+	}
+	if len(nested) > 0 {
+		t.nested = append([]message.ToolCall(nil), nested...)
+	} else {
+		t.nested = nil
+	}
+	t.stateHash = newHash
+	t.cachedWidth = 0
+	t.cachedRender = ""
+	t.Bump()
+}
+
+// ClearCache drops the cached rendered string and bumps the version.
+func (t *ToolMessageItem) ClearCache() {
+	t.cachedWidth = 0
+	t.cachedRender = ""
+	t.Bump()
+}
+
+// Render renders the tool call at width, returning the cached output on hit.
+func (t *ToolMessageItem) Render(width int) string {
+	width = max(1, width)
+	if t.cachedRender != "" && t.cachedWidth == width {
+		return t.cachedRender
+	}
+	rendered := renderToolCallBox(t.toolCall, t.result, t.nested, false, width)
+	t.cachedWidth = width
+	t.cachedRender = rendered
+	return rendered
+}
+
+func toolStateHash(tc message.ToolCall, result *message.ToolResult, nested []message.ToolCall) uint64 {
+	var tcFinished byte
+	if tc.Finished {
+		tcFinished = 1
+	}
+	fields := [][]byte{
+		[]byte(tc.ID),
+		[]byte(tc.Name),
+		[]byte(tc.Input),
+		[]byte(tc.Type),
+		{tcFinished},
+	}
+	if result != nil {
+		var isErr byte
+		if result.IsError {
+			isErr = 1
+		}
+		fields = append(fields,
+			[]byte{1, isErr},
+			[]byte(result.ToolCallID),
+			[]byte(result.Name),
+			[]byte(result.Content),
+			[]byte(result.Metadata),
+		)
+	} else {
+		fields = append(fields, []byte{0})
+	}
+	for _, n := range nested {
+		var nf byte
+		if n.Finished {
+			nf = 1
+		}
+		fields = append(fields, []byte(n.ID), []byte(n.Name), []byte(n.Input), []byte{nf})
+	}
+	return fnvFields(fields...)
 }
 
 func toolName(name string) string {
@@ -272,22 +662,24 @@ func getToolAction(name string) string {
 	return "Working..."
 }
 
-// renders params, params[0] (params[1]=params[2] ....)
+// renderParams formats params as: params[0] (params[1]=params[2], ...).
 func renderParams(paramsWidth int, params ...string) string {
-	if len(params) == 0 {
+	if len(params) == 0 || paramsWidth <= 0 {
 		return ""
 	}
 	mainParam := params[0]
-	if len(mainParam) > paramsWidth {
-		mainParam = mainParam[:paramsWidth-3] + "..."
+	if ansi.StringWidth(mainParam) > paramsWidth {
+		if paramsWidth <= 3 {
+			mainParam = ansi.Truncate(mainParam, paramsWidth, "")
+		} else {
+			mainParam = ansi.Truncate(mainParam, paramsWidth, "...")
+		}
 	}
 
 	if len(params) == 1 {
 		return mainParam
 	}
 	otherParams := params[1:]
-	// create pairs of key/value
-	// if odd number of params, the last one is a key without value
 	if len(otherParams)%2 != 0 {
 		otherParams = append(otherParams, "")
 	}
@@ -302,61 +694,50 @@ func renderParams(paramsWidth int, params ...string) string {
 	}
 
 	partsRendered := strings.Join(parts, ", ")
-	remainingWidth := paramsWidth - lipgloss.Width(partsRendered) - 5 // for the space
+	remainingWidth := paramsWidth - lipgloss.Width(partsRendered) - 5
 	if remainingWidth < 30 {
-		// No space for the params, just show the main
 		return mainParam
 	}
 
 	if len(parts) > 0 {
-		mainParam = fmt.Sprintf("%s (%s)", mainParam, strings.Join(parts, ", "))
+		mainParam = fmt.Sprintf("%s (%s)", mainParam, partsRendered)
 	}
 
 	return ansi.Truncate(mainParam, paramsWidth, "...")
 }
 
 func removeWorkingDirPrefix(path string) string {
-	wd := config.WorkingDirectory()
-	if strings.HasPrefix(path, wd) {
+	wd := workingDirectory()
+	if wd != "" && strings.HasPrefix(path, wd) {
 		path = strings.TrimPrefix(path, wd)
 	}
-	if strings.HasPrefix(path, "/") {
-		path = strings.TrimPrefix(path, "/")
-	}
-	if strings.HasPrefix(path, "./") {
-		path = strings.TrimPrefix(path, "./")
-	}
-	if strings.HasPrefix(path, "../") {
-		path = strings.TrimPrefix(path, "../")
-	}
+	path = strings.TrimPrefix(path, "/")
+	path = strings.TrimPrefix(path, "./")
+	path = strings.TrimPrefix(path, "../")
 	return path
 }
 
 func renderToolParams(paramWidth int, toolCall message.ToolCall) string {
-	params := ""
 	switch toolCall.Name {
 	case agent.AgentToolName:
 		var params agent.AgentParams
-		json.Unmarshal([]byte(toolCall.Input), &params)
+		_ = json.Unmarshal([]byte(toolCall.Input), &params)
 		prompt := strings.ReplaceAll(params.Prompt, "\n", " ")
 		return renderParams(paramWidth, prompt)
 	case tools.BashToolName:
 		var params tools.BashParams
-		json.Unmarshal([]byte(toolCall.Input), &params)
+		_ = json.Unmarshal([]byte(toolCall.Input), &params)
 		command := strings.ReplaceAll(params.Command, "\n", " ")
 		return renderParams(paramWidth, command)
 	case tools.EditToolName:
 		var params tools.EditParams
-		json.Unmarshal([]byte(toolCall.Input), &params)
+		_ = json.Unmarshal([]byte(toolCall.Input), &params)
 		filePath := removeWorkingDirPrefix(params.FilePath)
 		return renderParams(paramWidth, filePath)
 	case tools.FetchToolName:
 		var params tools.FetchParams
-		json.Unmarshal([]byte(toolCall.Input), &params)
-		url := params.URL
-		toolParams := []string{
-			url,
-		}
+		_ = json.Unmarshal([]byte(toolCall.Input), &params)
+		toolParams := []string{params.URL}
 		if params.Format != "" {
 			toolParams = append(toolParams, "format", params.Format)
 		}
@@ -366,22 +747,16 @@ func renderToolParams(paramWidth int, toolCall message.ToolCall) string {
 		return renderParams(paramWidth, toolParams...)
 	case tools.GlobToolName:
 		var params tools.GlobParams
-		json.Unmarshal([]byte(toolCall.Input), &params)
-		pattern := params.Pattern
-		toolParams := []string{
-			pattern,
-		}
+		_ = json.Unmarshal([]byte(toolCall.Input), &params)
+		toolParams := []string{params.Pattern}
 		if params.Path != "" {
 			toolParams = append(toolParams, "path", params.Path)
 		}
 		return renderParams(paramWidth, toolParams...)
 	case tools.GrepToolName:
 		var params tools.GrepParams
-		json.Unmarshal([]byte(toolCall.Input), &params)
-		pattern := params.Pattern
-		toolParams := []string{
-			pattern,
-		}
+		_ = json.Unmarshal([]byte(toolCall.Input), &params)
+		toolParams := []string{params.Pattern}
 		if params.Path != "" {
 			toolParams = append(toolParams, "path", params.Path)
 		}
@@ -394,7 +769,7 @@ func renderToolParams(paramWidth int, toolCall message.ToolCall) string {
 		return renderParams(paramWidth, toolParams...)
 	case tools.LSToolName:
 		var params tools.LSParams
-		json.Unmarshal([]byte(toolCall.Input), &params)
+		_ = json.Unmarshal([]byte(toolCall.Input), &params)
 		path := params.Path
 		if path == "" {
 			path = "."
@@ -402,15 +777,13 @@ func renderToolParams(paramWidth int, toolCall message.ToolCall) string {
 		return renderParams(paramWidth, path)
 	case tools.SourcegraphToolName:
 		var params tools.SourcegraphParams
-		json.Unmarshal([]byte(toolCall.Input), &params)
+		_ = json.Unmarshal([]byte(toolCall.Input), &params)
 		return renderParams(paramWidth, params.Query)
 	case tools.ViewToolName:
 		var params tools.ViewParams
-		json.Unmarshal([]byte(toolCall.Input), &params)
+		_ = json.Unmarshal([]byte(toolCall.Input), &params)
 		filePath := removeWorkingDirPrefix(params.FilePath)
-		toolParams := []string{
-			filePath,
-		}
+		toolParams := []string{filePath}
 		if params.Limit != 0 {
 			toolParams = append(toolParams, "limit", fmt.Sprintf("%d", params.Limit))
 		}
@@ -420,14 +793,13 @@ func renderToolParams(paramWidth int, toolCall message.ToolCall) string {
 		return renderParams(paramWidth, toolParams...)
 	case tools.WriteToolName:
 		var params tools.WriteParams
-		json.Unmarshal([]byte(toolCall.Input), &params)
+		_ = json.Unmarshal([]byte(toolCall.Input), &params)
 		filePath := removeWorkingDirPrefix(params.FilePath)
 		return renderParams(paramWidth, filePath)
 	default:
 		input := strings.ReplaceAll(toolCall.Input, "\n", " ")
-		params = renderParams(paramWidth, input)
+		return renderParams(paramWidth, input)
 	}
-	return params
 }
 
 func truncateHeight(content string, height int) string {
@@ -439,12 +811,13 @@ func truncateHeight(content string, height int) string {
 }
 
 func renderToolResponse(toolCall message.ToolCall, response message.ToolResult, width int) string {
+	width = max(1, width)
 	t := theme.CurrentTheme()
 	baseStyle := styles.BaseStyle()
 
 	if response.IsError {
 		errContent := fmt.Sprintf("Error: %s", strings.ReplaceAll(response.Content, "\n", " "))
-		errContent = ansi.Truncate(errContent, width-1, "...")
+		errContent = ansi.Truncate(errContent, max(1, width-1), "...")
 		return baseStyle.
 			Width(width).
 			Foreground(t.Error()).
@@ -454,25 +827,19 @@ func renderToolResponse(toolCall message.ToolCall, response message.ToolResult, 
 	resultContent := truncateHeight(response.Content, maxResultHeight)
 	switch toolCall.Name {
 	case agent.AgentToolName:
-		return styles.ForceReplaceBackgroundWithLipgloss(
-			toMarkdown(resultContent, false, width),
-			t.Background(),
-		)
+		return toMarkdown(resultContent, width)
 	case tools.BashToolName:
 		resultContent = fmt.Sprintf("```bash\n%s\n```", resultContent)
-		return styles.ForceReplaceBackgroundWithLipgloss(
-			toMarkdown(resultContent, true, width),
-			t.Background(),
-		)
+		return toMarkdown(resultContent, width)
 	case tools.EditToolName:
 		metadata := tools.EditResponseMetadata{}
-		json.Unmarshal([]byte(response.Metadata), &metadata)
+		_ = json.Unmarshal([]byte(response.Metadata), &metadata)
 		truncDiff := truncateHeight(metadata.Diff, maxResultHeight)
 		formattedDiff, _ := diff.FormatDiff(truncDiff, diff.WithTotalWidth(width))
 		return formattedDiff
 	case tools.FetchToolName:
 		var params tools.FetchParams
-		json.Unmarshal([]byte(toolCall.Input), &params)
+		_ = json.Unmarshal([]byte(toolCall.Input), &params)
 		mdFormat := "markdown"
 		switch params.Format {
 		case "text":
@@ -481,174 +848,134 @@ func renderToolResponse(toolCall message.ToolCall, response message.ToolResult, 
 			mdFormat = "html"
 		}
 		resultContent = fmt.Sprintf("```%s\n%s\n```", mdFormat, resultContent)
-		return styles.ForceReplaceBackgroundWithLipgloss(
-			toMarkdown(resultContent, true, width),
-			t.Background(),
-		)
-	case tools.GlobToolName:
-		return baseStyle.Width(width).Foreground(t.TextMuted()).Render(resultContent)
-	case tools.GrepToolName:
-		return baseStyle.Width(width).Foreground(t.TextMuted()).Render(resultContent)
-	case tools.LSToolName:
-		return baseStyle.Width(width).Foreground(t.TextMuted()).Render(resultContent)
-	case tools.SourcegraphToolName:
+		return toMarkdown(resultContent, width)
+	case tools.GlobToolName, tools.GrepToolName, tools.LSToolName, tools.SourcegraphToolName:
 		return baseStyle.Width(width).Foreground(t.TextMuted()).Render(resultContent)
 	case tools.ViewToolName:
 		metadata := tools.ViewResponseMetadata{}
-		json.Unmarshal([]byte(response.Metadata), &metadata)
+		_ = json.Unmarshal([]byte(response.Metadata), &metadata)
 		ext := filepath.Ext(metadata.FilePath)
-		if ext == "" {
-			ext = ""
-		} else {
+		if ext != "" {
 			ext = strings.ToLower(ext[1:])
 		}
 		resultContent = fmt.Sprintf("```%s\n%s\n```", ext, truncateHeight(metadata.Content, maxResultHeight))
-		return styles.ForceReplaceBackgroundWithLipgloss(
-			toMarkdown(resultContent, true, width),
-			t.Background(),
-		)
+		return toMarkdown(resultContent, width)
 	case tools.WriteToolName:
 		params := tools.WriteParams{}
-		json.Unmarshal([]byte(toolCall.Input), &params)
-		metadata := tools.WriteResponseMetadata{}
-		json.Unmarshal([]byte(response.Metadata), &metadata)
+		_ = json.Unmarshal([]byte(toolCall.Input), &params)
 		ext := filepath.Ext(params.FilePath)
-		if ext == "" {
-			ext = ""
-		} else {
+		if ext != "" {
 			ext = strings.ToLower(ext[1:])
 		}
 		resultContent = fmt.Sprintf("```%s\n%s\n```", ext, truncateHeight(params.Content, maxResultHeight))
-		return styles.ForceReplaceBackgroundWithLipgloss(
-			toMarkdown(resultContent, true, width),
-			t.Background(),
-		)
+		return toMarkdown(resultContent, width)
 	default:
 		resultContent = fmt.Sprintf("```text\n%s\n```", resultContent)
-		return styles.ForceReplaceBackgroundWithLipgloss(
-			toMarkdown(resultContent, true, width),
-			t.Background(),
-		)
+		return toMarkdown(resultContent, width)
 	}
 }
 
-func renderToolMessage(
+func renderToolCallBox(
 	toolCall message.ToolCall,
-	allMessages []message.Message,
-	messagesService message.Service,
-	focusedUIMessageId string,
+	response *message.ToolResult,
+	nestedCalls []message.ToolCall,
 	nested bool,
 	width int,
-	position int,
-) uiMessage {
+) string {
 	if nested {
-		width = width - 3
+		width = max(1, width-3)
 	}
+	innerWidth := max(1, width-2)
 
 	t := theme.CurrentTheme()
 	baseStyle := styles.BaseStyle()
 
 	style := baseStyle.
-		Width(width - 1).
+		Width(width).
 		BorderLeft(true).
 		BorderStyle(lipgloss.ThickBorder()).
 		PaddingLeft(1).
 		BorderForeground(t.TextMuted())
 
-	response := findToolResponse(toolCall.ID, allMessages)
 	toolNameText := baseStyle.Foreground(t.TextMuted()).
 		Render(fmt.Sprintf("%s: ", toolName(toolCall.Name)))
+	toolNameWidth := lipgloss.Width(toolNameText)
+	paramAvail := max(1, innerWidth-toolNameWidth)
 
 	if !toolCall.Finished {
-		// Get a brief description of what the tool is doing
 		toolAction := getToolAction(toolCall.Name)
-
 		progressText := baseStyle.
-			Width(width - 2 - lipgloss.Width(toolNameText)).
+			Width(paramAvail).
 			Foreground(t.TextMuted()).
-			Render(fmt.Sprintf("%s", toolAction))
+			Render(toolAction)
 
-		content := style.Render(lipgloss.JoinHorizontal(lipgloss.Left, toolNameText, progressText))
-		toolMsg := uiMessage{
-			messageType: toolMessageType,
-			position:    position,
-			height:      lipgloss.Height(content),
-			content:     content,
+		line := lipgloss.JoinHorizontal(lipgloss.Top, toolNameText, progressText)
+		if nested {
+			prefix := baseStyle.Foreground(t.TextMuted()).Render(" └ ")
+			return lipgloss.JoinHorizontal(lipgloss.Top, prefix, line)
 		}
-		return toolMsg
+		return style.Render(line)
 	}
 
-	params := renderToolParams(width-2-lipgloss.Width(toolNameText), toolCall)
-	responseContent := ""
-	if response != nil {
-		responseContent = renderToolResponse(toolCall, *response, width-2)
-		responseContent = strings.TrimSuffix(responseContent, "\n")
-	} else {
-		responseContent = baseStyle.
-			Italic(true).
-			Width(width - 2).
-			Foreground(t.TextMuted()).
-			Render("Waiting for response...")
-	}
+	params := renderToolParams(paramAvail, toolCall)
 
-	parts := []string{}
+	var parts []string
 	if !nested {
 		formattedParams := baseStyle.
-			Width(width - 2 - lipgloss.Width(toolNameText)).
+			Width(paramAvail).
 			Foreground(t.TextMuted()).
 			Render(params)
-
-		parts = append(parts, lipgloss.JoinHorizontal(lipgloss.Left, toolNameText, formattedParams))
+		parts = append(parts, lipgloss.JoinHorizontal(lipgloss.Top, toolNameText, formattedParams))
 	} else {
 		prefix := baseStyle.
 			Foreground(t.TextMuted()).
 			Render(" └ ")
+		nestedParamAvail := max(1, innerWidth-toolNameWidth-lipgloss.Width(prefix))
 		formattedParams := baseStyle.
-			Width(width - 2 - lipgloss.Width(toolNameText)).
+			Width(nestedParamAvail).
 			Foreground(t.TextMuted()).
 			Render(params)
-		parts = append(parts, lipgloss.JoinHorizontal(lipgloss.Left, prefix, toolNameText, formattedParams))
+		parts = append(parts, lipgloss.JoinHorizontal(lipgloss.Top, prefix, toolNameText, formattedParams))
 	}
 
-	if toolCall.Name == agent.AgentToolName {
-		taskMessages, _ := messagesService.List(context.Background(), toolCall.ID)
-		toolCalls := []message.ToolCall{}
-		for _, v := range taskMessages {
-			toolCalls = append(toolCalls, v.ToolCalls()...)
+	if toolCall.Name == agent.AgentToolName && !nested {
+		for _, call := range nestedCalls {
+			parts = append(parts, renderToolCallBox(call, nil, nil, true, width))
 		}
-		for _, call := range toolCalls {
-			rendered := renderToolMessage(call, []message.Message{}, messagesService, focusedUIMessageId, true, width, 0)
-			parts = append(parts, rendered.content)
-		}
-	}
-	if responseContent != "" && !nested {
-		parts = append(parts, responseContent)
 	}
 
-	content := style.Render(
-		lipgloss.JoinVertical(
-			lipgloss.Left,
-			parts...,
-		),
-	)
-	if nested {
-		content = lipgloss.JoinVertical(
-			lipgloss.Left,
-			parts...,
+	if !nested {
+		var responseContent string
+		if response != nil {
+			responseContent = renderToolResponse(toolCall, *response, innerWidth)
+			responseContent = strings.TrimSuffix(responseContent, "\n")
+		} else {
+			responseContent = baseStyle.
+				Italic(true).
+				Width(innerWidth).
+				Foreground(t.TextMuted()).
+				Render("Waiting for response...")
+		}
+		if responseContent != "" {
+			parts = append(parts, responseContent)
+		}
+		return style.Render(
+			lipgloss.JoinVertical(
+				lipgloss.Left,
+				parts...,
+			),
 		)
 	}
-	toolMsg := uiMessage{
-		messageType: toolMessageType,
-		position:    position,
-		height:      lipgloss.Height(content),
-		content:     content,
-	}
-	return toolMsg
+
+	return lipgloss.JoinVertical(
+		lipgloss.Left,
+		parts...,
+	)
 }
 
-// Helper function to format the time difference between two Unix timestamps
+// formatTimestampDiff formats the time difference between two Unix timestamps.
 func formatTimestampDiff(start, end int64) string {
-	diffSeconds := float64(end-start) / 1000.0 // Convert to seconds
+	diffSeconds := float64(end-start) / 1000.0
 	if diffSeconds < 1 {
 		return fmt.Sprintf("%dms", int(diffSeconds*1000))
 	}

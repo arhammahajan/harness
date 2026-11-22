@@ -3,15 +3,22 @@ package tui
 import (
 	"context"
 	"fmt"
+	"image"
+	"os"
 	"strings"
+	"time"
 
-	"github.com/charmbracelet/bubbles/key"
-	tea "github.com/charmbracelet/bubbletea"
-	"github.com/charmbracelet/lipgloss"
+	"charm.land/bubbles/v2/key"
+	tea "charm.land/bubbletea/v2"
+	"charm.land/lipgloss/v2"
+	uv "github.com/charmbracelet/ultraviolet"
+	uvlayout "github.com/charmbracelet/ultraviolet/layout"
+	"github.com/charmbracelet/ultraviolet/screen"
 	"github.com/arhammahajan/harness/internal/app"
 	"github.com/arhammahajan/harness/internal/config"
 	"github.com/arhammahajan/harness/internal/llm/agent"
 	"github.com/arhammahajan/harness/internal/logging"
+	"github.com/arhammahajan/harness/internal/lsp"
 	"github.com/arhammahajan/harness/internal/permission"
 	"github.com/arhammahajan/harness/internal/pubsub"
 	"github.com/arhammahajan/harness/internal/session"
@@ -20,6 +27,7 @@ import (
 	"github.com/arhammahajan/harness/internal/tui/components/dialog"
 	"github.com/arhammahajan/harness/internal/tui/layout"
 	"github.com/arhammahajan/harness/internal/tui/page"
+	"github.com/arhammahajan/harness/internal/tui/render"
 	"github.com/arhammahajan/harness/internal/tui/theme"
 	"github.com/arhammahajan/harness/internal/tui/util"
 )
@@ -95,6 +103,13 @@ var logsKeyReturnKey = key.NewBinding(
 	key.WithHelp("esc/q", "go back"),
 )
 
+// frameKey identifies a memoized rendered frame for the chat page.
+type frameKey struct {
+	width, height int
+	page          page.PageID
+	chat          chat.RenderState
+}
+
 type appModel struct {
 	width, height   int
 	currentPage     page.PageID
@@ -138,31 +153,169 @@ type appModel struct {
 
 	isCompacting      bool
 	compactingMessage string
+
+	// Crush rendering pipeline state: whole-frame memoization, shared
+	// animation clock, and discovered terminal capabilities.
+	frames           *render.FrameCache[frameKey]
+	scrollOnlyUpdate bool
+	frameDirty       bool
+	frameSkipPut     bool
+	frameGCArmed     bool
+	animClock        render.AnimClock
+	caps             render.Capabilities
 }
 
-func (a appModel) Init() tea.Cmd {
+func (a *appModel) chatPage() page.ChatPageModel {
+	cp, _ := a.pages[page.ChatPage].(page.ChatPageModel)
+	return cp
+}
+
+func (a *appModel) hasModalOpen() bool {
+	return a.showPermissions ||
+		a.showFilepicker ||
+		a.isCompacting ||
+		a.showHelp ||
+		a.showQuit ||
+		a.showSessionDialog ||
+		a.showModelDialog ||
+		a.showCommandDialog ||
+		a.showInitDialog ||
+		a.showThemeDialog ||
+		a.showMultiArgumentsDialog
+}
+
+func (a *appModel) isAgentBusy() bool {
+	return a.app != nil && a.app.CoderAgent != nil && a.app.CoderAgent.IsBusy()
+}
+
+func (a *appModel) markScrollOnly() {
+	a.scrollOnlyUpdate = true
+}
+
+func (a *appModel) invalidateFrames() {
+	a.frameDirty = true
+}
+
+func (a *appModel) beginFrameUpdate() {
+	a.scrollOnlyUpdate = false
+	a.frameSkipPut = false
+}
+
+func (a *appModel) frameCacheable() bool {
+	if a.frames == nil || a.currentPage != page.ChatPage || a.hasModalOpen() {
+		return false
+	}
+	if cp := a.chatPage(); cp != nil && cp.CompletionOpen() {
+		return false
+	}
+	return a.width > 0 && a.height > 0
+}
+
+func (a *appModel) armFrameGC() tea.Cmd {
+	if a.frames == nil || a.frameGCArmed {
+		return nil
+	}
+	a.frameGCArmed = true
+	return tea.Tick(a.frames.TTL(), func(time.Time) tea.Msg { return render.FrameGCMsg{} })
+}
+
+func (a *appModel) endFrameUpdate() tea.Cmd {
+	if !a.scrollOnlyUpdate || !a.frameCacheable() {
+		return nil
+	}
+	return a.armFrameGC()
+}
+
+func (a *appModel) handleFrameGC() {
+	a.frameGCArmed = false
+	if a.frames == nil {
+		return
+	}
+	a.frames.GC(time.Now())
+	if a.frames.Len() == 0 {
+		a.frameSkipPut = true
+		return
+	}
+	a.scrollOnlyUpdate = true
+}
+
+func (a *appModel) frameKeyNow() (frameKey, bool) {
+	if !a.frameCacheable() {
+		return frameKey{}, false
+	}
+	cp := a.chatPage()
+	if cp == nil {
+		return frameKey{}, false
+	}
+	return frameKey{
+		width:  a.width,
+		height: a.height,
+		page:   a.currentPage,
+		chat:   cp.ChatRenderState(),
+	}, true
+}
+
+func (a *appModel) currentFrameKey() (frameKey, bool) {
+	scrollOnly := a.scrollOnlyUpdate && !a.frameDirty
+	a.scrollOnlyUpdate = false
+	a.frameDirty = false
+	if a.frames == nil {
+		return frameKey{}, false
+	}
+	if !scrollOnly {
+		a.frames.Reset()
+	}
+	return a.frameKeyNow()
+}
+
+func (a *appModel) storeFrame(key frameKey, content string, cursor *tea.Cursor) {
+	if a.frameDirty {
+		a.frameDirty = false
+		a.frames.Reset()
+		return
+	}
+	if a.frameSkipPut {
+		a.frameSkipPut = false
+		return
+	}
+	if now, ok := a.frameKeyNow(); !ok || now != key {
+		return
+	}
+	a.frames.Put(key, content, cursor)
+}
+
+func (a *appModel) updateTail(cmds []tea.Cmd) (tea.Model, tea.Cmd) {
+	if a.currentPage == page.ChatPage {
+		if cp := a.chatPage(); cp != nil {
+			if cmd := a.animClock.Ensure(func() bool { return cp.IsAnimating() }); cmd != nil {
+				cmds = append(cmds, cmd)
+			}
+			if cmd := cp.EnsureScrollbarHide(); cmd != nil {
+				cmds = append(cmds, cmd)
+			}
+		}
+	}
+	if cmd := a.endFrameUpdate(); cmd != nil {
+		cmds = append(cmds, cmd)
+	}
+	return a, tea.Batch(cmds...)
+}
+
+func (a *appModel) Init() tea.Cmd {
 	var cmds []tea.Cmd
 	cmd := a.pages[a.currentPage].Init()
 	a.loadedPages[a.currentPage] = true
 	cmds = append(cmds, cmd)
-	cmd = a.status.Init()
-	cmds = append(cmds, cmd)
-	cmd = a.quit.Init()
-	cmds = append(cmds, cmd)
-	cmd = a.help.Init()
-	cmds = append(cmds, cmd)
-	cmd = a.sessionDialog.Init()
-	cmds = append(cmds, cmd)
-	cmd = a.commandDialog.Init()
-	cmds = append(cmds, cmd)
-	cmd = a.modelDialog.Init()
-	cmds = append(cmds, cmd)
-	cmd = a.initDialog.Init()
-	cmds = append(cmds, cmd)
-	cmd = a.filepicker.Init()
-	cmds = append(cmds, cmd)
-	cmd = a.themeDialog.Init()
-	cmds = append(cmds, cmd)
+	cmds = append(cmds, a.status.Init())
+	cmds = append(cmds, a.quit.Init())
+	cmds = append(cmds, a.help.Init())
+	cmds = append(cmds, a.sessionDialog.Init())
+	cmds = append(cmds, a.commandDialog.Init())
+	cmds = append(cmds, a.modelDialog.Init())
+	cmds = append(cmds, a.initDialog.Init())
+	cmds = append(cmds, a.filepicker.Init())
+	cmds = append(cmds, a.themeDialog.Init())
+	cmds = append(cmds, render.QueryCmd(uv.Environ(os.Environ())))
 
 	// Check if we should show the init dialog
 	cmds = append(cmds, func() tea.Msg {
@@ -179,55 +332,124 @@ func (a appModel) Init() tea.Cmd {
 	return tea.Batch(cmds...)
 }
 
-func (a appModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
+func (a *appModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
+	a.beginFrameUpdate()
+	a.caps.Update(msg)
+
 	var cmds []tea.Cmd
 	var cmd tea.Cmd
+
 	switch msg := msg.(type) {
+	case render.FrameGCMsg:
+		a.handleFrameGC()
+		return a.updateTail(cmds)
+
+	case render.AnimTickMsg:
+		if !a.animClock.Accept(msg) || a.currentPage != page.ChatPage {
+			a.markScrollOnly()
+			return a.updateTail(cmds)
+		}
+		cp := a.chatPage()
+		if cp == nil || !cp.AdvanceAnimation() {
+			a.markScrollOnly()
+			return a.updateTail(cmds)
+		}
+		return a.updateTail(cmds)
+
+	case chat.WarmMsg:
+		if cp := a.chatPage(); cp != nil {
+			warmCmd, done := cp.WarmStep(msg.Seq)
+			if warmCmd != nil {
+				cmds = append(cmds, warmCmd)
+			}
+			if !done {
+				a.markScrollOnly()
+			} else {
+				a.invalidateFrames()
+			}
+		}
+		return a.updateTail(cmds)
+
+	case tea.BackgroundColorMsg:
+		theme.SetHasDarkBackground(msg.IsDark())
+		if cp := a.chatPage(); cp != nil {
+			cp.Restyle()
+		}
+		a.invalidateFrames()
+		return a.updateTail(cmds)
+
+	case render.CoalescedWheelMsg:
+		if !a.hasModalOpen() {
+			if a.currentPage == page.ChatPage {
+				if cp := a.chatPage(); cp != nil {
+					cp.HandleWheel(msg)
+					a.markScrollOnly()
+					return a.updateTail(cmds)
+				}
+			}
+			a.pages[a.currentPage], cmd = a.pages[a.currentPage].Update(msg)
+			cmds = append(cmds, cmd)
+			return a.updateTail(cmds)
+		}
+
 	case tea.WindowSizeMsg:
-		msg.Height -= 1 // Make space for the status bar
 		a.width, a.height = msg.Width, msg.Height
+		a.invalidateFrames()
+
+		pageSizeMsg := tea.WindowSizeMsg{
+			Width:  msg.Width,
+			Height: max(0, msg.Height-1), // Make space for the status bar
+		}
+
+		if a.currentPage == page.ChatPage {
+			if cp := a.chatPage(); cp != nil {
+				cmds = append(cmds, cp.BeginResize())
+			}
+		}
 
 		s, _ := a.status.Update(msg)
 		a.status = s.(core.StatusCmp)
-		a.pages[a.currentPage], cmd = a.pages[a.currentPage].Update(msg)
+		a.pages[a.currentPage], cmd = a.pages[a.currentPage].Update(pageSizeMsg)
 		cmds = append(cmds, cmd)
 
-		prm, permCmd := a.permissions.Update(msg)
+		prm, permCmd := a.permissions.Update(pageSizeMsg)
 		a.permissions = prm.(dialog.PermissionDialogCmp)
 		cmds = append(cmds, permCmd)
 
-		help, helpCmd := a.help.Update(msg)
+		help, helpCmd := a.help.Update(pageSizeMsg)
 		a.help = help.(dialog.HelpCmp)
 		cmds = append(cmds, helpCmd)
 
-		session, sessionCmd := a.sessionDialog.Update(msg)
-		a.sessionDialog = session.(dialog.SessionDialog)
+		sess, sessionCmd := a.sessionDialog.Update(pageSizeMsg)
+		a.sessionDialog = sess.(dialog.SessionDialog)
 		cmds = append(cmds, sessionCmd)
 
-		command, commandCmd := a.commandDialog.Update(msg)
+		command, commandCmd := a.commandDialog.Update(pageSizeMsg)
 		a.commandDialog = command.(dialog.CommandDialog)
 		cmds = append(cmds, commandCmd)
 
-		filepicker, filepickerCmd := a.filepicker.Update(msg)
+		filepicker, filepickerCmd := a.filepicker.Update(pageSizeMsg)
 		a.filepicker = filepicker.(dialog.FilepickerCmp)
 		cmds = append(cmds, filepickerCmd)
 
-		a.initDialog.SetSize(msg.Width, msg.Height)
+		a.initDialog.SetSize(pageSizeMsg.Width, pageSizeMsg.Height)
 
 		if a.showMultiArgumentsDialog {
-			a.multiArgumentsDialog.SetSize(msg.Width, msg.Height)
-			args, argsCmd := a.multiArgumentsDialog.Update(msg)
+			a.multiArgumentsDialog.SetSize(pageSizeMsg.Width, pageSizeMsg.Height)
+			args, argsCmd := a.multiArgumentsDialog.Update(pageSizeMsg)
 			a.multiArgumentsDialog = args.(dialog.MultiArgumentsDialogCmp)
 			cmds = append(cmds, argsCmd, a.multiArgumentsDialog.Init())
 		}
 
-		return a, tea.Batch(cmds...)
+		return a.updateTail(cmds)
+
 	// Status
 	case util.InfoMsg:
 		s, cmd := a.status.Update(msg)
 		a.status = s.(core.StatusCmp)
 		cmds = append(cmds, cmd)
-		return a, tea.Batch(cmds...)
+		return a.updateTail(cmds)
+
 	case pubsub.Event[logging.LogMessage]:
 		if msg.Payload.Persist {
 			switch msg.Payload.Level {
@@ -247,14 +469,12 @@ func (a appModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				})
 				a.status = s.(core.StatusCmp)
 				cmds = append(cmds, cmd)
-
 			case "warn":
 				s, cmd := a.status.Update(util.InfoMsg{
 					Type: util.InfoTypeWarn,
 					Msg:  msg.Payload.Message,
 					TTL:  msg.Payload.PersistTime,
 				})
-
 				a.status = s.(core.StatusCmp)
 				cmds = append(cmds, cmd)
 			default:
@@ -267,6 +487,7 @@ func (a appModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				cmds = append(cmds, cmd)
 			}
 		}
+
 	case util.ClearStatusMsg:
 		s, _ := a.status.Update(msg)
 		a.status = s.(core.StatusCmp)
@@ -274,186 +495,216 @@ func (a appModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	// Permission
 	case pubsub.Event[permission.PermissionRequest]:
 		a.showPermissions = true
-		return a, a.permissions.SetPermissions(msg.Payload)
+		a.invalidateFrames()
+		cmds = append(cmds, a.permissions.SetPermissions(msg.Payload))
+		return a.updateTail(cmds)
+
 	case dialog.PermissionResponseMsg:
-		var cmd tea.Cmd
-		switch msg.Action {
-		case dialog.PermissionAllow:
-			a.app.Permissions.Grant(msg.Permission)
-		case dialog.PermissionAllowForSession:
-			a.app.Permissions.GrantPersistant(msg.Permission)
-		case dialog.PermissionDeny:
-			a.app.Permissions.Deny(msg.Permission)
+		if a.app != nil && a.app.Permissions != nil {
+			switch msg.Action {
+			case dialog.PermissionAllow:
+				a.app.Permissions.Grant(msg.Permission)
+			case dialog.PermissionAllowForSession:
+				a.app.Permissions.GrantPersistant(msg.Permission)
+			case dialog.PermissionDeny:
+				a.app.Permissions.Deny(msg.Permission)
+			}
 		}
 		a.showPermissions = false
-		return a, cmd
+		a.invalidateFrames()
+		return a.updateTail(cmds)
 
 	case page.PageChangeMsg:
-		return a, a.moveToPage(msg.ID)
+		a.invalidateFrames()
+		cmds = append(cmds, a.moveToPage(msg.ID))
+		return a.updateTail(cmds)
 
 	case dialog.CloseQuitMsg:
 		a.showQuit = false
-		return a, nil
+		a.invalidateFrames()
+		return a.updateTail(cmds)
 
 	case dialog.CloseSessionDialogMsg:
 		a.showSessionDialog = false
-		return a, nil
+		a.invalidateFrames()
+		return a.updateTail(cmds)
 
 	case dialog.CloseCommandDialogMsg:
 		a.showCommandDialog = false
-		return a, nil
+		a.invalidateFrames()
+		return a.updateTail(cmds)
 
 	case startCompactSessionMsg:
-		// Start compacting the current session
 		a.isCompacting = true
 		a.compactingMessage = "Starting summarization..."
+		a.invalidateFrames()
 
 		if a.selectedSession.ID == "" {
 			a.isCompacting = false
-			return a, util.ReportWarn("No active session to summarize")
+			cmds = append(cmds, util.ReportWarn("No active session to summarize"))
+			return a.updateTail(cmds)
 		}
 
-		// Start the summarization process
-		return a, func() tea.Msg {
+		cmds = append(cmds, func() tea.Msg {
 			ctx := context.Background()
-			a.app.CoderAgent.Summarize(ctx, a.selectedSession.ID)
+			if a.app != nil && a.app.CoderAgent != nil {
+				a.app.CoderAgent.Summarize(ctx, a.selectedSession.ID)
+			}
 			return nil
-		}
+		})
+		return a.updateTail(cmds)
 
 	case pubsub.Event[agent.AgentEvent]:
 		payload := msg.Payload
 		if payload.Error != nil {
 			a.isCompacting = false
-			return a, util.ReportError(payload.Error)
+			cmds = append(cmds, util.ReportError(payload.Error))
+			return a.updateTail(cmds)
 		}
 
 		a.compactingMessage = payload.Progress
 
 		if payload.Done && payload.Type == agent.AgentEventTypeSummarize {
 			a.isCompacting = false
-			return a, util.ReportInfo("Session summarization complete")
+			cmds = append(cmds, util.ReportInfo("Session summarization complete"))
+			return a.updateTail(cmds)
 		} else if payload.Done && payload.Type == agent.AgentEventTypeResponse && a.selectedSession.ID != "" {
-			model := a.app.CoderAgent.Model()
-			contextWindow := model.ContextWindow
-			tokens := a.selectedSession.CompletionTokens + a.selectedSession.PromptTokens
-			if (tokens >= int64(float64(contextWindow)*0.95)) && config.Get().AutoCompact {
-				return a, util.CmdHandler(startCompactSessionMsg{})
+			if a.app != nil && a.app.CoderAgent != nil {
+				model := a.app.CoderAgent.Model()
+				contextWindow := model.ContextWindow
+				tokens := a.selectedSession.CompletionTokens + a.selectedSession.PromptTokens
+				if cfg := config.Get(); cfg != nil && (tokens >= int64(float64(contextWindow)*0.95)) && cfg.AutoCompact {
+					cmds = append(cmds, util.CmdHandler(startCompactSessionMsg{}))
+					return a.updateTail(cmds)
+				}
 			}
 		}
-		// Continue listening for events
-		return a, nil
+		return a.updateTail(cmds)
 
 	case dialog.CloseThemeDialogMsg:
 		a.showThemeDialog = false
-		return a, nil
+		a.invalidateFrames()
+		return a.updateTail(cmds)
 
 	case dialog.ThemeChangedMsg:
+		if cp := a.chatPage(); cp != nil {
+			cp.Restyle()
+		}
 		a.pages[a.currentPage], cmd = a.pages[a.currentPage].Update(msg)
 		a.showThemeDialog = false
-		return a, tea.Batch(cmd, util.ReportInfo("Theme changed to: "+msg.ThemeName))
+		a.invalidateFrames()
+		cmds = append(cmds, cmd, util.ReportInfo("Theme changed to: "+msg.ThemeName))
+		return a.updateTail(cmds)
 
 	case dialog.CloseModelDialogMsg:
 		a.showModelDialog = false
-		return a, nil
+		a.invalidateFrames()
+		return a.updateTail(cmds)
 
 	case dialog.ModelSelectedMsg:
 		a.showModelDialog = false
-
-		model, err := a.app.CoderAgent.Update(config.AgentCoder, msg.Model.ID)
-		if err != nil {
-			return a, util.ReportError(err)
+		a.invalidateFrames()
+		if a.app != nil && a.app.CoderAgent != nil {
+			model, err := a.app.CoderAgent.Update(config.AgentCoder, msg.Model.ID)
+			if err != nil {
+				cmds = append(cmds, util.ReportError(err))
+				return a.updateTail(cmds)
+			}
+			cmds = append(cmds, util.ReportInfo(fmt.Sprintf("Model changed to %s", model.Name)))
 		}
-
-		return a, util.ReportInfo(fmt.Sprintf("Model changed to %s", model.Name))
+		return a.updateTail(cmds)
 
 	case dialog.ShowInitDialogMsg:
 		a.showInitDialog = msg.Show
-		return a, nil
+		a.invalidateFrames()
+		return a.updateTail(cmds)
 
 	case dialog.CloseInitDialogMsg:
 		a.showInitDialog = false
+		a.invalidateFrames()
 		if msg.Initialize {
-			// Run the initialization command
-			for _, cmd := range a.commands {
-				if cmd.ID == "init" {
-					// Mark the project as initialized
+			for _, c := range a.commands {
+				if c.ID == "init" {
 					if err := config.MarkProjectInitialized(); err != nil {
-						return a, util.ReportError(err)
+						cmds = append(cmds, util.ReportError(err))
+						return a.updateTail(cmds)
 					}
-					return a, cmd.Handler(cmd)
+					cmds = append(cmds, c.Handler(c))
+					return a.updateTail(cmds)
 				}
 			}
 		} else {
-			// Mark the project as initialized without running the command
 			if err := config.MarkProjectInitialized(); err != nil {
-				return a, util.ReportError(err)
+				cmds = append(cmds, util.ReportError(err))
+				return a.updateTail(cmds)
 			}
 		}
-		return a, nil
+		return a.updateTail(cmds)
 
 	case chat.SessionSelectedMsg:
 		a.selectedSession = msg
 		a.sessionDialog.SetSelectedSession(msg.ID)
+		a.invalidateFrames()
 
 	case pubsub.Event[session.Session]:
 		if msg.Type == pubsub.UpdatedEvent && msg.Payload.ID == a.selectedSession.ID {
 			a.selectedSession = msg.Payload
 		}
+
 	case dialog.SessionSelectedMsg:
 		a.showSessionDialog = false
+		a.invalidateFrames()
 		if a.currentPage == page.ChatPage {
-			return a, util.CmdHandler(chat.SessionSelectedMsg(msg.Session))
+			cmds = append(cmds, util.CmdHandler(chat.SessionSelectedMsg(msg.Session)))
 		}
-		return a, nil
+		return a.updateTail(cmds)
 
 	case dialog.CommandSelectedMsg:
 		a.showCommandDialog = false
-		// Execute the command handler if available
+		a.invalidateFrames()
 		if msg.Command.Handler != nil {
-			return a, msg.Command.Handler(msg.Command)
+			cmds = append(cmds, msg.Command.Handler(msg.Command))
+			return a.updateTail(cmds)
 		}
-		return a, util.ReportInfo("Command selected: " + msg.Command.Title)
+		cmds = append(cmds, util.ReportInfo("Command selected: "+msg.Command.Title))
+		return a.updateTail(cmds)
 
 	case dialog.ShowMultiArgumentsDialogMsg:
-		// Show multi-arguments dialog
 		a.multiArgumentsDialog = dialog.NewMultiArgumentsDialogCmp(msg.CommandID, msg.Content, msg.ArgNames)
+		a.multiArgumentsDialog.SetSize(a.width, max(0, a.height-1))
 		a.showMultiArgumentsDialog = true
-		return a, a.multiArgumentsDialog.Init()
+		a.invalidateFrames()
+		cmds = append(cmds, a.multiArgumentsDialog.Init())
+		return a.updateTail(cmds)
 
 	case dialog.CloseMultiArgumentsDialogMsg:
-		// Close multi-arguments dialog
 		a.showMultiArgumentsDialog = false
-
-		// If submitted, replace all named arguments and run the command
+		a.invalidateFrames()
 		if msg.Submit {
 			content := msg.Content
-
-			// Replace each named argument with its value
 			for name, value := range msg.Args {
 				placeholder := "$" + name
 				content = strings.ReplaceAll(content, placeholder, value)
 			}
-
-			// Execute the command with arguments
-			return a, util.CmdHandler(dialog.CommandRunCustomMsg{
+			cmds = append(cmds, util.CmdHandler(dialog.CommandRunCustomMsg{
 				Content: content,
 				Args:    msg.Args,
-			})
+			}))
 		}
-		return a, nil
+		return a.updateTail(cmds)
 
-	case tea.KeyMsg:
-		// If multi-arguments dialog is open, let it handle the key press first
+	case tea.KeyPressMsg:
 		if a.showMultiArgumentsDialog {
 			args, cmd := a.multiArgumentsDialog.Update(msg)
 			a.multiArgumentsDialog = args.(dialog.MultiArgumentsDialogCmp)
-			return a, cmd
+			cmds = append(cmds, cmd)
+			return a.updateTail(cmds)
 		}
 
 		switch {
-
 		case key.Matches(msg, keys.Quit):
 			a.showQuit = !a.showQuit
+			a.invalidateFrames()
 			if a.showHelp {
 				a.showHelp = false
 			}
@@ -473,117 +724,143 @@ func (a appModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			if a.showMultiArgumentsDialog {
 				a.showMultiArgumentsDialog = false
 			}
-			return a, nil
+			return a.updateTail(cmds)
+
 		case key.Matches(msg, keys.SwitchSession):
 			if a.currentPage == page.ChatPage && !a.showQuit && !a.showPermissions && !a.showCommandDialog {
-				// Load sessions and show the dialog
+				if a.app == nil || a.app.Sessions == nil {
+					cmds = append(cmds, util.ReportWarn("No sessions available"))
+					return a.updateTail(cmds)
+				}
 				sessions, err := a.app.Sessions.List(context.Background())
 				if err != nil {
-					return a, util.ReportError(err)
+					cmds = append(cmds, util.ReportError(err))
+					return a.updateTail(cmds)
 				}
 				if len(sessions) == 0 {
-					return a, util.ReportWarn("No sessions available")
+					cmds = append(cmds, util.ReportWarn("No sessions available"))
+					return a.updateTail(cmds)
 				}
 				a.sessionDialog.SetSessions(sessions)
 				a.showSessionDialog = true
-				return a, nil
+				a.invalidateFrames()
+				return a.updateTail(cmds)
 			}
-			return a, nil
+			return a.updateTail(cmds)
+
 		case key.Matches(msg, keys.Commands):
 			if a.currentPage == page.ChatPage && !a.showQuit && !a.showPermissions && !a.showSessionDialog && !a.showThemeDialog && !a.showFilepicker {
-				// Show commands dialog
 				if len(a.commands) == 0 {
-					return a, util.ReportWarn("No commands available")
+					cmds = append(cmds, util.ReportWarn("No commands available"))
+					return a.updateTail(cmds)
 				}
 				a.commandDialog.SetCommands(a.commands)
 				a.showCommandDialog = true
-				return a, nil
+				a.invalidateFrames()
+				return a.updateTail(cmds)
 			}
-			return a, nil
+			return a.updateTail(cmds)
+
 		case key.Matches(msg, keys.Models):
 			if a.showModelDialog {
 				a.showModelDialog = false
-				return a, nil
+				a.invalidateFrames()
+				return a.updateTail(cmds)
 			}
 			if a.currentPage == page.ChatPage && !a.showQuit && !a.showPermissions && !a.showSessionDialog && !a.showCommandDialog {
 				a.showModelDialog = true
-				return a, nil
+				a.invalidateFrames()
+				return a.updateTail(cmds)
 			}
-			return a, nil
+			return a.updateTail(cmds)
+
 		case key.Matches(msg, keys.SwitchTheme):
 			if !a.showQuit && !a.showPermissions && !a.showSessionDialog && !a.showCommandDialog {
-				// Show theme switcher dialog
 				a.showThemeDialog = true
-				// Theme list is dynamically loaded by the dialog component
-				return a, a.themeDialog.Init()
+				a.invalidateFrames()
+				cmds = append(cmds, a.themeDialog.Init())
+				return a.updateTail(cmds)
 			}
-			return a, nil
-		case key.Matches(msg, returnKey) || key.Matches(msg):
+			return a.updateTail(cmds)
+
+		case key.Matches(msg, returnKey) || msg.String() == quitKey:
 			if msg.String() == quitKey {
 				if a.currentPage == page.LogsPage {
-					return a, a.moveToPage(page.ChatPage)
+					cmds = append(cmds, a.moveToPage(page.ChatPage))
+					return a.updateTail(cmds)
 				}
 			} else if !a.filepicker.IsCWDFocused() {
 				if a.showQuit {
 					a.showQuit = !a.showQuit
-					return a, nil
+					a.invalidateFrames()
+					return a.updateTail(cmds)
 				}
 				if a.showHelp {
 					a.showHelp = !a.showHelp
-					return a, nil
+					a.invalidateFrames()
+					return a.updateTail(cmds)
 				}
 				if a.showInitDialog {
 					a.showInitDialog = false
-					// Mark the project as initialized without running the command
+					a.invalidateFrames()
 					if err := config.MarkProjectInitialized(); err != nil {
-						return a, util.ReportError(err)
+						cmds = append(cmds, util.ReportError(err))
 					}
-					return a, nil
+					return a.updateTail(cmds)
 				}
 				if a.showFilepicker {
 					a.showFilepicker = false
 					a.filepicker.ToggleFilepicker(a.showFilepicker)
-					return a, nil
+					a.invalidateFrames()
+					return a.updateTail(cmds)
 				}
 				if a.currentPage == page.LogsPage {
-					return a, a.moveToPage(page.ChatPage)
+					cmds = append(cmds, a.moveToPage(page.ChatPage))
+					return a.updateTail(cmds)
 				}
 			}
+
 		case key.Matches(msg, keys.Logs):
-			return a, a.moveToPage(page.LogsPage)
+			cmds = append(cmds, a.moveToPage(page.LogsPage))
+			return a.updateTail(cmds)
+
 		case key.Matches(msg, keys.Help):
 			if a.showQuit {
-				return a, nil
+				return a.updateTail(cmds)
 			}
 			a.showHelp = !a.showHelp
-			return a, nil
+			a.invalidateFrames()
+			return a.updateTail(cmds)
+
 		case key.Matches(msg, helpEsc):
-			if a.app.CoderAgent.IsBusy() {
+			if a.isAgentBusy() {
 				if a.showQuit {
-					return a, nil
+					return a.updateTail(cmds)
 				}
 				a.showHelp = !a.showHelp
-				return a, nil
+				a.invalidateFrames()
+				return a.updateTail(cmds)
 			}
+
 		case key.Matches(msg, keys.Filepicker):
 			a.showFilepicker = !a.showFilepicker
 			a.filepicker.ToggleFilepicker(a.showFilepicker)
-			return a, nil
+			a.invalidateFrames()
+			return a.updateTail(cmds)
 		}
+
 	default:
 		f, filepickerCmd := a.filepicker.Update(msg)
 		a.filepicker = f.(dialog.FilepickerCmp)
 		cmds = append(cmds, filepickerCmd)
-
 	}
 
 	if a.showFilepicker {
 		f, filepickerCmd := a.filepicker.Update(msg)
 		a.filepicker = f.(dialog.FilepickerCmp)
 		cmds = append(cmds, filepickerCmd)
-		// Only block key messages send all other messages down
-		if _, ok := msg.(tea.KeyMsg); ok {
-			return a, tea.Batch(cmds...)
+		if _, ok := msg.(tea.KeyPressMsg); ok {
+			return a.updateTail(cmds)
 		}
 	}
 
@@ -591,18 +868,16 @@ func (a appModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		q, quitCmd := a.quit.Update(msg)
 		a.quit = q.(dialog.QuitDialog)
 		cmds = append(cmds, quitCmd)
-		// Only block key messages send all other messages down
-		if _, ok := msg.(tea.KeyMsg); ok {
-			return a, tea.Batch(cmds...)
+		if _, ok := msg.(tea.KeyPressMsg); ok {
+			return a.updateTail(cmds)
 		}
 	}
 	if a.showPermissions {
 		d, permissionsCmd := a.permissions.Update(msg)
 		a.permissions = d.(dialog.PermissionDialogCmp)
 		cmds = append(cmds, permissionsCmd)
-		// Only block key messages send all other messages down
-		if _, ok := msg.(tea.KeyMsg); ok {
-			return a, tea.Batch(cmds...)
+		if _, ok := msg.(tea.KeyPressMsg); ok {
+			return a.updateTail(cmds)
 		}
 	}
 
@@ -610,9 +885,8 @@ func (a appModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		d, sessionCmd := a.sessionDialog.Update(msg)
 		a.sessionDialog = d.(dialog.SessionDialog)
 		cmds = append(cmds, sessionCmd)
-		// Only block key messages send all other messages down
-		if _, ok := msg.(tea.KeyMsg); ok {
-			return a, tea.Batch(cmds...)
+		if _, ok := msg.(tea.KeyPressMsg); ok {
+			return a.updateTail(cmds)
 		}
 	}
 
@@ -620,9 +894,8 @@ func (a appModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		d, commandCmd := a.commandDialog.Update(msg)
 		a.commandDialog = d.(dialog.CommandDialog)
 		cmds = append(cmds, commandCmd)
-		// Only block key messages send all other messages down
-		if _, ok := msg.(tea.KeyMsg); ok {
-			return a, tea.Batch(cmds...)
+		if _, ok := msg.(tea.KeyPressMsg); ok {
+			return a.updateTail(cmds)
 		}
 	}
 
@@ -630,9 +903,8 @@ func (a appModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		d, modelCmd := a.modelDialog.Update(msg)
 		a.modelDialog = d.(dialog.ModelDialog)
 		cmds = append(cmds, modelCmd)
-		// Only block key messages send all other messages down
-		if _, ok := msg.(tea.KeyMsg); ok {
-			return a, tea.Batch(cmds...)
+		if _, ok := msg.(tea.KeyPressMsg); ok {
+			return a.updateTail(cmds)
 		}
 	}
 
@@ -640,9 +912,8 @@ func (a appModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		d, initCmd := a.initDialog.Update(msg)
 		a.initDialog = d.(dialog.InitDialogCmp)
 		cmds = append(cmds, initCmd)
-		// Only block key messages send all other messages down
-		if _, ok := msg.(tea.KeyMsg); ok {
-			return a, tea.Batch(cmds...)
+		if _, ok := msg.(tea.KeyPressMsg); ok {
+			return a.updateTail(cmds)
 		}
 	}
 
@@ -650,9 +921,8 @@ func (a appModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		d, themeCmd := a.themeDialog.Update(msg)
 		a.themeDialog = d.(dialog.ThemeDialog)
 		cmds = append(cmds, themeCmd)
-		// Only block key messages send all other messages down
-		if _, ok := msg.(tea.KeyMsg); ok {
-			return a, tea.Batch(cmds...)
+		if _, ok := msg.(tea.KeyPressMsg); ok {
+			return a.updateTail(cmds)
 		}
 	}
 
@@ -660,10 +930,20 @@ func (a appModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	a.status = s.(core.StatusCmp)
 	a.pages[a.currentPage], cmd = a.pages[a.currentPage].Update(msg)
 	cmds = append(cmds, cmd)
-	return a, tea.Batch(cmds...)
+
+	// Mark pure chat scroll key presses as scroll-only so the whole-frame
+	// cache can serve revisited scroll positions directly from memory.
+	if km, ok := msg.(tea.KeyPressMsg); ok && a.currentPage == page.ChatPage && !a.hasModalOpen() {
+		switch km.String() {
+		case "pgup", "pgdown", "ctrl+u", "ctrl+d":
+			a.markScrollOnly()
+		}
+	}
+
+	return a.updateTail(cmds)
 }
 
-// RegisterCommand adds a command to the command dialog
+// RegisterCommand adds a command to the command dialog.
 func (a *appModel) RegisterCommand(cmd dialog.Command) {
 	a.commands = append(a.commands, cmd)
 }
@@ -678,8 +958,7 @@ func (a *appModel) findCommand(id string) (dialog.Command, bool) {
 }
 
 func (a *appModel) moveToPage(pageID page.PageID) tea.Cmd {
-	if a.app.CoderAgent.IsBusy() {
-		// For now we don't move to any page if the agent is busy
+	if a.isAgentBusy() {
 		return util.ReportWarn("Agent is busy, please wait...")
 	}
 
@@ -691,55 +970,57 @@ func (a *appModel) moveToPage(pageID page.PageID) tea.Cmd {
 	}
 	a.previousPage = a.currentPage
 	a.currentPage = pageID
+	a.invalidateFrames()
 	if sizable, ok := a.pages[a.currentPage].(layout.Sizeable); ok {
-		cmd := sizable.SetSize(a.width, a.height)
+		cmd := sizable.SetSize(a.width, max(0, a.height-1))
 		cmds = append(cmds, cmd)
 	}
 
 	return tea.Batch(cmds...)
 }
 
-func (a appModel) View() string {
-	components := []string{
-		a.pages[a.currentPage].View(),
+// Draw implements [layout.Drawable] and draws the root UI onto scr.
+func (a *appModel) Draw(scr uv.Screen, area uv.Rectangle) *tea.Cursor {
+	if area.Empty() {
+		return nil
 	}
 
-	components = append(components, a.status.View())
+	screen.Clear(scr)
 
-	appView := lipgloss.JoinVertical(lipgloss.Top, components...)
+	var pageRect, statusRect image.Rectangle
+	uvlayout.Vertical(
+		uvlayout.Fill(1),
+		uvlayout.Len(1),
+	).Split(area).Assign(&pageRect, &statusRect)
+
+	var cur *tea.Cursor
+	if p := a.pages[a.currentPage]; p != nil {
+		if drawable, ok := p.(layout.Drawable); ok {
+			cur = drawable.Draw(scr, pageRect)
+		} else {
+			v := p.View()
+			layout.DrawAt(scr, pageRect, v.Content)
+			if v.Cursor != nil {
+				c := *v.Cursor
+				c.X += pageRect.Min.X
+				c.Y += pageRect.Min.Y
+				cur = &c
+			}
+		}
+	}
+
+	a.status.Draw(scr, statusRect)
+
+	bounds := scr.Bounds()
 
 	if a.showPermissions {
-		overlay := a.permissions.View()
-		row := lipgloss.Height(appView) / 2
-		row -= lipgloss.Height(overlay) / 2
-		col := lipgloss.Width(appView) / 2
-		col -= lipgloss.Width(overlay) / 2
-		appView = layout.PlaceOverlay(
-			col,
-			row,
-			overlay,
-			appView,
-			true,
-		)
+		cur = a.permissions.Draw(scr, bounds)
 	}
 
 	if a.showFilepicker {
-		overlay := a.filepicker.View()
-		row := lipgloss.Height(appView) / 2
-		row -= lipgloss.Height(overlay) / 2
-		col := lipgloss.Width(appView) / 2
-		col -= lipgloss.Width(overlay) / 2
-		appView = layout.PlaceOverlay(
-			col,
-			row,
-			overlay,
-			appView,
-			true,
-		)
-
+		cur = a.filepicker.Draw(scr, bounds)
 	}
 
-	// Show compacting status overlay
 	if a.isCompacting {
 		t := theme.CurrentTheme()
 		style := lipgloss.NewStyle().
@@ -751,17 +1032,8 @@ func (a appModel) View() string {
 			Foreground(t.Text())
 
 		overlay := style.Render("Summarizing\n" + a.compactingMessage)
-		row := lipgloss.Height(appView) / 2
-		row -= lipgloss.Height(overlay) / 2
-		col := lipgloss.Width(appView) / 2
-		col -= lipgloss.Width(overlay) / 2
-		appView = layout.PlaceOverlay(
-			col,
-			row,
-			overlay,
-			appView,
-			true,
-		)
+		layout.DrawCenter(scr, bounds, overlay)
+		cur = nil
 	}
 
 	if a.showHelp {
@@ -775,135 +1047,95 @@ func (a appModel) View() string {
 		if a.currentPage == page.LogsPage {
 			bindings = append(bindings, logsKeyReturnKey)
 		}
-		if !a.app.CoderAgent.IsBusy() {
+		if !a.isAgentBusy() {
 			bindings = append(bindings, helpEsc)
 		}
 		a.help.SetBindings(bindings)
-
-		overlay := a.help.View()
-		row := lipgloss.Height(appView) / 2
-		row -= lipgloss.Height(overlay) / 2
-		col := lipgloss.Width(appView) / 2
-		col -= lipgloss.Width(overlay) / 2
-		appView = layout.PlaceOverlay(
-			col,
-			row,
-			overlay,
-			appView,
-			true,
-		)
+		cur = a.help.Draw(scr, bounds)
 	}
 
 	if a.showQuit {
-		overlay := a.quit.View()
-		row := lipgloss.Height(appView) / 2
-		row -= lipgloss.Height(overlay) / 2
-		col := lipgloss.Width(appView) / 2
-		col -= lipgloss.Width(overlay) / 2
-		appView = layout.PlaceOverlay(
-			col,
-			row,
-			overlay,
-			appView,
-			true,
-		)
+		cur = a.quit.Draw(scr, bounds)
 	}
 
 	if a.showSessionDialog {
-		overlay := a.sessionDialog.View()
-		row := lipgloss.Height(appView) / 2
-		row -= lipgloss.Height(overlay) / 2
-		col := lipgloss.Width(appView) / 2
-		col -= lipgloss.Width(overlay) / 2
-		appView = layout.PlaceOverlay(
-			col,
-			row,
-			overlay,
-			appView,
-			true,
-		)
+		cur = a.sessionDialog.Draw(scr, bounds)
 	}
 
 	if a.showModelDialog {
-		overlay := a.modelDialog.View()
-		row := lipgloss.Height(appView) / 2
-		row -= lipgloss.Height(overlay) / 2
-		col := lipgloss.Width(appView) / 2
-		col -= lipgloss.Width(overlay) / 2
-		appView = layout.PlaceOverlay(
-			col,
-			row,
-			overlay,
-			appView,
-			true,
-		)
+		cur = a.modelDialog.Draw(scr, bounds)
 	}
 
 	if a.showCommandDialog {
-		overlay := a.commandDialog.View()
-		row := lipgloss.Height(appView) / 2
-		row -= lipgloss.Height(overlay) / 2
-		col := lipgloss.Width(appView) / 2
-		col -= lipgloss.Width(overlay) / 2
-		appView = layout.PlaceOverlay(
-			col,
-			row,
-			overlay,
-			appView,
-			true,
-		)
+		cur = a.commandDialog.Draw(scr, bounds)
 	}
 
 	if a.showInitDialog {
-		overlay := a.initDialog.View()
-		appView = layout.PlaceOverlay(
-			a.width/2-lipgloss.Width(overlay)/2,
-			a.height/2-lipgloss.Height(overlay)/2,
-			overlay,
-			appView,
-			true,
-		)
+		cur = a.initDialog.Draw(scr, bounds)
 	}
 
 	if a.showThemeDialog {
-		overlay := a.themeDialog.View()
-		row := lipgloss.Height(appView) / 2
-		row -= lipgloss.Height(overlay) / 2
-		col := lipgloss.Width(appView) / 2
-		col -= lipgloss.Width(overlay) / 2
-		appView = layout.PlaceOverlay(
-			col,
-			row,
-			overlay,
-			appView,
-			true,
-		)
+		cur = a.themeDialog.Draw(scr, bounds)
 	}
 
 	if a.showMultiArgumentsDialog {
-		overlay := a.multiArgumentsDialog.View()
-		row := lipgloss.Height(appView) / 2
-		row -= lipgloss.Height(overlay) / 2
-		col := lipgloss.Width(appView) / 2
-		col -= lipgloss.Width(overlay) / 2
-		appView = layout.PlaceOverlay(
-			col,
-			row,
-			overlay,
-			appView,
-			true,
-		)
+		cur = a.multiArgumentsDialog.Draw(scr, bounds)
 	}
 
-	return appView
+	return cur
+}
+
+func (a *appModel) View() tea.View {
+	var v tea.View
+	v.AltScreen = true
+	if t := theme.CurrentTheme(); t != nil {
+		v.BackgroundColor = t.Background()
+	}
+	v.MouseMode = tea.MouseModeCellMotion
+	v.ReportFocus = a.caps.ReportFocusEvents
+	v.WindowTitle = "harness"
+
+	key, cacheable := a.currentFrameKey()
+	if cacheable {
+		if content, cursor, ok := a.frames.Get(key); ok {
+			v.Content = content
+			v.Cursor = cursor
+			return v
+		}
+	}
+
+	w, h := a.width, a.height
+	if w <= 0 || h <= 0 {
+		return v
+	}
+
+	canvas := uv.NewScreenBuffer(w, h)
+	v.Cursor = a.Draw(canvas, canvas.Bounds())
+
+	content := strings.ReplaceAll(canvas.Render(), "\r\n", "\n")
+	contentLines := strings.Split(content, "\n")
+	for i, line := range contentLines {
+		contentLines[i] = strings.TrimRight(line, " ")
+	}
+	content = strings.Join(contentLines, "\n")
+
+	v.Content = content
+	if cacheable {
+		a.storeFrame(key, content, v.Cursor)
+	}
+	return v
 }
 
 func New(app *app.App) tea.Model {
 	startPage := page.ChatPage
+	var lspClients map[string]*lsp.Client
+	if app != nil {
+		lspClients = app.LSPClients
+	}
 	model := &appModel{
 		currentPage:   startPage,
 		loadedPages:   make(map[page.PageID]bool),
-		status:        core.NewStatusCmp(app.LSPClients),
+		status:        core.NewStatusCmp(lspClients),
 		help:          dialog.NewHelpCmp(),
 		quit:          dialog.NewQuitCmp(),
 		sessionDialog: dialog.NewSessionDialogCmp(),
@@ -919,6 +1151,7 @@ func New(app *app.App) tea.Model {
 			page.LogsPage: page.NewLogsPage(),
 		},
 		filepicker: dialog.NewFilepickerCmp(app),
+		frames:     render.NewFrameCache[frameKey](render.DefaultFrameCacheTTL, render.DefaultFrameCacheMaxEntries),
 	}
 
 	model.RegisterCommand(dialog.Command{
@@ -951,6 +1184,7 @@ If there are Cursor rules (in .cursor/rules/ or .cursorrules) or Copilot rules (
 			}
 		},
 	})
+
 	// Load custom commands
 	customCommands, err := dialog.LoadCustomCommands()
 	if err != nil {

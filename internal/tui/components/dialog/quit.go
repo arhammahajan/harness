@@ -3,9 +3,10 @@ package dialog
 import (
 	"strings"
 
-	"github.com/charmbracelet/bubbles/key"
-	tea "github.com/charmbracelet/bubbletea"
-	"github.com/charmbracelet/lipgloss"
+	"charm.land/bubbles/v2/key"
+	tea "charm.land/bubbletea/v2"
+	"charm.land/lipgloss/v2"
+	uv "github.com/charmbracelet/ultraviolet"
 	"github.com/arhammahajan/harness/internal/tui/layout"
 	"github.com/arhammahajan/harness/internal/tui/styles"
 	"github.com/arhammahajan/harness/internal/tui/theme"
@@ -19,6 +20,7 @@ type CloseQuitMsg struct{}
 type QuitDialog interface {
 	tea.Model
 	layout.Bindings
+	layout.Drawable
 }
 
 type quitDialogCmp struct {
@@ -62,7 +64,7 @@ func (q *quitDialogCmp) Init() tea.Cmd {
 
 func (q *quitDialogCmp) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	switch msg := msg.(type) {
-	case tea.KeyMsg:
+	case tea.KeyPressMsg:
 		switch {
 		case key.Matches(msg, helpKeys.LeftRight) || key.Matches(msg, helpKeys.Tab):
 			q.selectedNo = !q.selectedNo
@@ -81,10 +83,10 @@ func (q *quitDialogCmp) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	return q, nil
 }
 
-func (q *quitDialogCmp) View() string {
+func (q *quitDialogCmp) render() string {
 	t := theme.CurrentTheme()
 	baseStyle := styles.BaseStyle()
-	
+
 	yesStyle := baseStyle
 	noStyle := baseStyle
 	spacerStyle := baseStyle.Background(t.Background())
@@ -121,8 +123,17 @@ func (q *quitDialogCmp) View() string {
 		Border(lipgloss.RoundedBorder()).
 		BorderBackground(t.Background()).
 		BorderForeground(t.TextMuted()).
-		Width(lipgloss.Width(content) + 4).
+		Width(lipgloss.Width(content) + 6).
 		Render(content)
+}
+
+func (q *quitDialogCmp) View() tea.View {
+	return tea.NewView(q.render())
+}
+
+func (q *quitDialogCmp) Draw(scr uv.Screen, area uv.Rectangle) *tea.Cursor {
+	layout.DrawCenter(scr, area, q.render())
+	return nil
 }
 
 func (q *quitDialogCmp) BindingKeys() []key.Binding {

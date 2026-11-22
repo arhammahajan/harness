@@ -4,13 +4,15 @@ import (
 	"encoding/json"
 	"slices"
 
-	"github.com/charmbracelet/bubbles/key"
-	"github.com/charmbracelet/bubbles/table"
-	tea "github.com/charmbracelet/bubbletea"
+	"charm.land/bubbles/v2/key"
+	"charm.land/bubbles/v2/table"
+	tea "charm.land/bubbletea/v2"
+	"charm.land/lipgloss/v2"
+	uv "github.com/charmbracelet/ultraviolet"
 	"github.com/arhammahajan/harness/internal/logging"
 	"github.com/arhammahajan/harness/internal/pubsub"
 	"github.com/arhammahajan/harness/internal/tui/layout"
-	"github.com/arhammahajan/harness/internal/tui/styles"
+	"github.com/arhammahajan/harness/internal/tui/render"
 	"github.com/arhammahajan/harness/internal/tui/theme"
 	"github.com/arhammahajan/harness/internal/tui/util"
 )
@@ -19,10 +21,13 @@ type TableComponent interface {
 	tea.Model
 	layout.Sizeable
 	layout.Bindings
+	layout.Drawable
 }
 
 type tableCmp struct {
-	table table.Model
+	width, height int
+	table         table.Model
+	drawCache     *render.DrawCache
 }
 
 type selectedLogMsg logging.LogMessage
@@ -44,8 +49,8 @@ func (i *tableCmp) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	cmds = append(cmds, cmd)
 	i.table = t
 	selectedRow := i.table.SelectedRow()
-	if selectedRow != nil {
-		if prevSelectedRow == nil || selectedRow[0] == prevSelectedRow[0] {
+	if len(selectedRow) > 0 {
+		if len(prevSelectedRow) == 0 || selectedRow[0] != prevSelectedRow[0] {
 			var log logging.LogMessage
 			for _, row := range logging.List() {
 				if row.ID == selectedRow[0] {
@@ -61,27 +66,60 @@ func (i *tableCmp) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	return i, tea.Batch(cmds...)
 }
 
-func (i *tableCmp) View() string {
+func (i *tableCmp) renderView() string {
 	t := theme.CurrentTheme()
-	defaultStyles := table.DefaultStyles()
-	defaultStyles.Selected = defaultStyles.Selected.Foreground(t.Primary())
-	i.table.SetStyles(defaultStyles)
-	return styles.ForceReplaceBackgroundWithLipgloss(i.table.View(), t.Background())
+	tableStyles := table.DefaultStyles()
+	tableStyles.Header = tableStyles.Header.
+		Foreground(t.TextEmphasized()).
+		Background(t.Background())
+	tableStyles.Cell = tableStyles.Cell.
+		Foreground(t.Text()).
+		Background(t.Background())
+	tableStyles.Selected = tableStyles.Selected.
+		Foreground(t.Primary()).
+		Background(t.Background())
+	i.table.SetStyles(tableStyles)
+
+	style := lipgloss.NewStyle().Background(t.Background())
+	if i.width > 0 && i.height > 0 {
+		style = style.Width(i.width).Height(i.height)
+	}
+	return style.Render(i.table.View())
+}
+
+func (i *tableCmp) View() tea.View {
+	return tea.NewView(i.renderView())
+}
+
+func (i *tableCmp) Draw(scr uv.Screen, area uv.Rectangle) *tea.Cursor {
+	if area.Empty() {
+		return nil
+	}
+	if i.drawCache == nil {
+		i.drawCache = render.NewDrawCache()
+	}
+	i.drawCache.Draw(scr, area, i.renderView())
+	return nil
 }
 
 func (i *tableCmp) GetSize() (int, int) {
-	return i.table.Width(), i.table.Height()
+	return i.width, i.height
 }
 
 func (i *tableCmp) SetSize(width int, height int) tea.Cmd {
+	i.width = width
+	i.height = height
 	i.table.SetWidth(width)
 	i.table.SetHeight(height)
-	cloumns := i.table.Columns()
-	for i, col := range cloumns {
-		col.Width = (width / len(cloumns)) - 2
-		cloumns[i] = col
+	columns := i.table.Columns()
+	if len(columns) > 0 {
+		colWidth := max(0, (width/len(columns))-2)
+		for idx, col := range columns {
+			col.Width = colWidth
+			columns[idx] = col
+		}
+		i.table.SetColumns(columns)
 	}
-	i.table.SetColumns(cloumns)
 	return nil
 }
 
@@ -92,7 +130,7 @@ func (i *tableCmp) BindingKeys() []key.Binding {
 func (i *tableCmp) setRows() {
 	rows := []table.Row{}
 
-	logs := logging.List()
+	logs := slices.Clone(logging.List())
 	slices.SortFunc(logs, func(a, b logging.LogMessage) int {
 		if a.Time.Before(b.Time) {
 			return 1
@@ -132,6 +170,7 @@ func NewLogsTable() TableComponent {
 	)
 	tableModel.Focus()
 	return &tableCmp{
-		table: tableModel,
+		table:     tableModel,
+		drawCache: render.NewDrawCache(),
 	}
 }

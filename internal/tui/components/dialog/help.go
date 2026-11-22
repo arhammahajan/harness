@@ -3,9 +3,11 @@ package dialog
 import (
 	"strings"
 
-	"github.com/charmbracelet/bubbles/key"
-	tea "github.com/charmbracelet/bubbletea"
-	"github.com/charmbracelet/lipgloss"
+	"charm.land/bubbles/v2/key"
+	tea "charm.land/bubbletea/v2"
+	"charm.land/lipgloss/v2"
+	uv "github.com/charmbracelet/ultraviolet"
+	"github.com/arhammahajan/harness/internal/tui/layout"
 	"github.com/arhammahajan/harness/internal/tui/styles"
 	"github.com/arhammahajan/harness/internal/tui/theme"
 )
@@ -57,6 +59,11 @@ func (h *helpCmp) render() string {
 	t := theme.CurrentTheme()
 	baseStyle := styles.BaseStyle()
 
+	w := h.width
+	if w <= 0 {
+		w = 90
+	}
+
 	helpKeyStyle := styles.Bold().
 		Background(t.Background()).
 		Foreground(t.Text()).
@@ -107,9 +114,9 @@ func (h *helpCmp) render() string {
 			}
 		}
 		maxKeyWidth := 0
-		for _, key := range keys {
-			if maxKeyWidth < lipgloss.Width(key) {
-				maxKeyWidth = lipgloss.Width(key)
+		for _, k := range keys {
+			if maxKeyWidth < lipgloss.Width(k) {
+				maxKeyWidth = lipgloss.Width(k)
 			}
 		}
 		for i := range keys {
@@ -128,7 +135,7 @@ func (h *helpCmp) render() string {
 		// check whether it exceeds the maximum width avail (the width of the
 		// terminal, subtracting 2 for the borders).
 		width += lipgloss.Width(pair)
-		if width > h.width-2 {
+		if width > w-2 {
 			break
 		}
 		pairs = append(pairs, pair)
@@ -144,9 +151,9 @@ func (h *helpCmp) render() string {
 			lipgloss.Left,              // x
 			lipgloss.Top,               // y
 			lastPair,                   // content
-			lipgloss.WithWhitespaceBackground(t.Background()),
+			lipgloss.WithWhitespaceStyle(lipgloss.NewStyle().Background(t.Background())),
 		))
-		content := baseStyle.Width(h.width).Render(
+		content := baseStyle.Width(w).Render(
 			lipgloss.JoinHorizontal(
 				lipgloss.Top,
 				prefix...,
@@ -156,7 +163,7 @@ func (h *helpCmp) render() string {
 	}
 
 	// Join pairs of columns and enclose in a border
-	content := baseStyle.Width(h.width).Render(
+	content := baseStyle.Width(w).Render(
 		lipgloss.JoinHorizontal(
 			lipgloss.Top,
 			pairs...,
@@ -165,9 +172,14 @@ func (h *helpCmp) render() string {
 	return content
 }
 
-func (h *helpCmp) View() string {
+func (h *helpCmp) renderView() string {
 	t := theme.CurrentTheme()
 	baseStyle := styles.BaseStyle()
+
+	w := h.width
+	if w <= 0 {
+		w = 90
+	}
 
 	content := h.render()
 	header := baseStyle.
@@ -179,7 +191,7 @@ func (h *helpCmp) View() string {
 	return baseStyle.Padding(1).
 		Border(lipgloss.RoundedBorder()).
 		BorderForeground(t.TextMuted()).
-		Width(h.width).
+		Width(w + 4).
 		BorderBackground(t.Background()).
 		Render(
 			lipgloss.JoinVertical(lipgloss.Center,
@@ -190,8 +202,18 @@ func (h *helpCmp) View() string {
 		)
 }
 
+func (h *helpCmp) View() tea.View {
+	return tea.NewView(h.renderView())
+}
+
+func (h *helpCmp) Draw(scr uv.Screen, area uv.Rectangle) *tea.Cursor {
+	layout.DrawCenter(scr, area, h.renderView())
+	return nil
+}
+
 type HelpCmp interface {
 	tea.Model
+	layout.Drawable
 	SetBindings([]key.Binding)
 }
 

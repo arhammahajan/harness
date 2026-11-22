@@ -1,169 +1,110 @@
 package layout
 
 import (
+	"image"
 	"strings"
 
-	"github.com/charmbracelet/lipgloss"
-	chAnsi "github.com/charmbracelet/x/ansi"
-	"github.com/muesli/ansi"
-	"github.com/muesli/reflow/truncate"
-	"github.com/muesli/termenv"
-	"github.com/arhammahajan/harness/internal/tui/styles"
-	"github.com/arhammahajan/harness/internal/tui/theme"
-	"github.com/arhammahajan/harness/internal/tui/util"
+	tea "charm.land/bubbletea/v2"
+	"charm.land/lipgloss/v2"
+	uv "github.com/charmbracelet/ultraviolet"
 )
 
-// Most of this code is borrowed from
-// https://github.com/charmbracelet/lipgloss/pull/102
-// as well as the lipgloss library, with some modification for what I needed.
+// Scrollbar glyph defaults matching Crush's scrollbar rendering.
+const (
+	ScrollbarThumb = "┃"
+	ScrollbarTrack = "│"
+)
 
-// Split a string into lines, additionally returning the size of the widest
-// line.
-func getLines(s string) (lines []string, widest int) {
-	lines = strings.Split(s, "\n")
-
-	for _, l := range lines {
-		w := ansi.PrintableRuneWidth(l)
-		if widest < w {
-			widest = w
-		}
-	}
-
-	return lines, widest
+// CenterRect returns a new [uv.Rectangle] centered within area with the
+// specified width and height.
+func CenterRect(area uv.Rectangle, width, height int) uv.Rectangle {
+	centerX := area.Min.X + area.Dx()/2
+	centerY := area.Min.Y + area.Dy()/2
+	minX := centerX - width/2
+	minY := centerY - height/2
+	maxX := minX + width
+	maxY := minY + height
+	return image.Rect(minX, minY, maxX, maxY)
 }
 
-// PlaceOverlay places fg on top of bg.
-func PlaceOverlay(
-	x, y int,
-	fg, bg string,
-	shadow bool, opts ...WhitespaceOption,
-) string {
-	fgLines, fgWidth := getLines(fg)
-	bgLines, bgWidth := getLines(bg)
-	bgHeight := len(bgLines)
-	fgHeight := len(fgLines)
+// BottomLeftRect returns a new [uv.Rectangle] positioned at the bottom-left
+// within area with the specified width and height.
+func BottomLeftRect(area uv.Rectangle, width, height int) uv.Rectangle {
+	minX := area.Min.X
+	maxX := minX + width
+	maxY := area.Max.Y
+	minY := maxY - height
+	return image.Rect(minX, minY, maxX, maxY)
+}
 
-	if shadow {
-		t := theme.CurrentTheme()
-		baseStyle := styles.BaseStyle()
-
-		var shadowbg string = ""
-		shadowchar := lipgloss.NewStyle().
-			Background(t.BackgroundDarker()).
-			Foreground(t.Background()).
-			Render("░")
-		bgchar := baseStyle.Render(" ")
-		for i := 0; i <= fgHeight; i++ {
-			if i == 0 {
-				shadowbg += bgchar + strings.Repeat(bgchar, fgWidth) + "\n"
-			} else {
-				shadowbg += bgchar + strings.Repeat(shadowchar, fgWidth) + "\n"
-			}
+// ClearArea zeros every cell inside area on scr.
+func ClearArea(scr uv.Screen, area uv.Rectangle) {
+	for y := area.Min.Y; y < area.Max.Y; y++ {
+		for x := area.Min.X; x < area.Max.X; x++ {
+			scr.SetCell(x, y, nil)
 		}
+	}
+}
 
-		fg = PlaceOverlay(0, 0, fg, shadowbg, false, opts...)
-		fgLines, fgWidth = getLines(fg)
-		fgHeight = len(fgLines)
+// DrawAt draws the ANSI-styled view string onto scr within area.
+func DrawAt(scr uv.Screen, area uv.Rectangle, view string) {
+	uv.NewStyledString(view).Draw(scr, area)
+}
+
+// DrawCenter draws the given string view centered in area.
+func DrawCenter(scr uv.Screen, area uv.Rectangle, view string) {
+	DrawCenterCursor(scr, area, view, nil)
+}
+
+// DrawCenterCursor draws the given string view centered in area and translates
+// cur (if non-nil) from view-local coordinates to screen coordinates. Content
+// larger than area is clamped to fit.
+func DrawCenterCursor(scr uv.Screen, area uv.Rectangle, view string, cur *tea.Cursor) {
+	width, height := lipgloss.Size(view)
+	width = min(width, area.Dx())
+	height = min(height, area.Dy())
+	center := CenterRect(area, width, height)
+	if cur != nil {
+		cur.X += center.Min.X
+		cur.Y += center.Min.Y
+	}
+	uv.NewStyledString(view).Draw(scr, center)
+}
+
+// Scrollbar renders a vertical scrollbar based on content and viewport size.
+// Returns an empty string if content fits within viewport (no scrolling needed).
+func Scrollbar(height, contentSize, viewportSize, offset int, thumbStyle, trackStyle lipgloss.Style) string {
+	if height <= 0 || contentSize <= viewportSize {
+		return ""
 	}
 
-	if fgWidth >= bgWidth && fgHeight >= bgHeight {
-		// FIXME: return fg or bg?
-		return fg
-	}
-	// TODO: allow placement outside of the bg box?
-	x = util.Clamp(x, 0, bgWidth-fgWidth)
-	y = util.Clamp(y, 0, bgHeight-fgHeight)
+	// Calculate thumb size (minimum 1 character).
+	thumbSize := max(1, height*viewportSize/contentSize)
 
-	ws := &whitespace{}
-	for _, opt := range opts {
-		opt(ws)
+	// Calculate thumb position.
+	maxOffset := contentSize - viewportSize
+	if maxOffset <= 0 {
+		return ""
 	}
 
-	var b strings.Builder
-	for i, bgLine := range bgLines {
+	offset = max(0, offset)
+	trackSpace := height - thumbSize
+	thumbPos := 0
+	if trackSpace > 0 && maxOffset > 0 {
+		thumbPos = min(trackSpace, offset*trackSpace/maxOffset)
+	}
+
+	var sb strings.Builder
+	for i := range height {
 		if i > 0 {
-			b.WriteByte('\n')
+			sb.WriteString("\n")
 		}
-		if i < y || i >= y+fgHeight {
-			b.WriteString(bgLine)
-			continue
+		if i >= thumbPos && i < thumbPos+thumbSize {
+			sb.WriteString(thumbStyle.Render(ScrollbarThumb))
+		} else {
+			sb.WriteString(trackStyle.Render(ScrollbarTrack))
 		}
-
-		pos := 0
-		if x > 0 {
-			left := truncate.String(bgLine, uint(x))
-			pos = ansi.PrintableRuneWidth(left)
-			b.WriteString(left)
-			if pos < x {
-				b.WriteString(ws.render(x - pos))
-				pos = x
-			}
-		}
-
-		fgLine := fgLines[i-y]
-		b.WriteString(fgLine)
-		pos += ansi.PrintableRuneWidth(fgLine)
-
-		right := cutLeft(bgLine, pos)
-		bgWidth := ansi.PrintableRuneWidth(bgLine)
-		rightWidth := ansi.PrintableRuneWidth(right)
-		if rightWidth <= bgWidth-pos {
-			b.WriteString(ws.render(bgWidth - rightWidth - pos))
-		}
-
-		b.WriteString(right)
 	}
 
-	return b.String()
+	return sb.String()
 }
-
-// cutLeft cuts printable characters from the left.
-// This function is heavily based on muesli's ansi and truncate packages.
-func cutLeft(s string, cutWidth int) string {
-	return chAnsi.Cut(s, cutWidth, lipgloss.Width(s))
-}
-
-func max(a, b int) int {
-	if a > b {
-		return a
-	}
-	return b
-}
-
-type whitespace struct {
-	style termenv.Style
-	chars string
-}
-
-// Render whitespaces.
-func (w whitespace) render(width int) string {
-	if w.chars == "" {
-		w.chars = " "
-	}
-
-	r := []rune(w.chars)
-	j := 0
-	b := strings.Builder{}
-
-	// Cycle through runes and print them into the whitespace.
-	for i := 0; i < width; {
-		b.WriteRune(r[j])
-		j++
-		if j >= len(r) {
-			j = 0
-		}
-		i += ansi.PrintableRuneWidth(string(r[j]))
-	}
-
-	// Fill any extra gaps white spaces. This might be necessary if any runes
-	// are more than one cell wide, which could leave a one-rune gap.
-	short := width - ansi.PrintableRuneWidth(b.String())
-	if short > 0 {
-		b.WriteString(strings.Repeat(" ", short))
-	}
-
-	return w.style.Styled(b.String())
-}
-
-// WhitespaceOption sets a styling rule for rendering whitespace.
-type WhitespaceOption func(*whitespace)

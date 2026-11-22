@@ -2,16 +2,18 @@ package chat
 
 import (
 	"fmt"
+	"image"
 	"os"
 	"os/exec"
 	"slices"
 	"strings"
 	"unicode"
 
-	"github.com/charmbracelet/bubbles/key"
-	"github.com/charmbracelet/bubbles/textarea"
-	tea "github.com/charmbracelet/bubbletea"
-	"github.com/charmbracelet/lipgloss"
+	"charm.land/bubbles/v2/key"
+	"charm.land/bubbles/v2/textarea"
+	tea "charm.land/bubbletea/v2"
+	"charm.land/lipgloss/v2"
+	uv "github.com/charmbracelet/ultraviolet"
 	"github.com/arhammahajan/harness/internal/app"
 	"github.com/arhammahajan/harness/internal/logging"
 	"github.com/arhammahajan/harness/internal/message"
@@ -33,6 +35,8 @@ type editorCmp struct {
 	deleteMode  bool
 }
 
+var _ layout.Drawable = (*editorCmp)(nil)
+
 type EditorKeyMaps struct {
 	Send       key.Binding
 	OpenEditor key.Binding
@@ -43,6 +47,7 @@ type bluredEditorKeyMaps struct {
 	Focus      key.Binding
 	OpenEditor key.Binding
 }
+
 type DeleteAttachmentKeyMaps struct {
 	AttachmentDeleteMode key.Binding
 	Escape               key.Binding
@@ -76,7 +81,8 @@ var DeleteKeyMaps = DeleteAttachmentKeyMaps{
 }
 
 const (
-	maxAttachments = 5
+	maxAttachments    = 5
+	editorPromptWidth = 2 // PaddingLeft(1) + ">"
 )
 
 func (m *editorCmp) openEditor() tea.Cmd {
@@ -116,11 +122,16 @@ func (m *editorCmp) openEditor() tea.Cmd {
 }
 
 func (m *editorCmp) Init() tea.Cmd {
-	return textarea.Blink
+	// Hardware cursor blinks natively in the terminal; no synthetic blink tick.
+	return nil
+}
+
+func (m *editorCmp) isSessionBusy() bool {
+	return m.app != nil && m.app.CoderAgent != nil && m.app.CoderAgent.IsSessionBusy(m.session.ID)
 }
 
 func (m *editorCmp) send() tea.Cmd {
-	if m.app.CoderAgent.IsSessionBusy(m.session.ID) {
+	if m.isSessionBusy() {
 		return util.ReportWarn("Agent is working, please wait...")
 	}
 
@@ -129,6 +140,7 @@ func (m *editorCmp) send() tea.Cmd {
 	attachments := m.attachments
 
 	m.attachments = nil
+	m.syncTextareaSize()
 	if value == "" {
 		return nil
 	}
@@ -145,6 +157,7 @@ func (m *editorCmp) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	switch msg := msg.(type) {
 	case dialog.ThemeChangedMsg:
 		m.textarea = CreateTextArea(&m.textarea)
+		m.syncTextareaSize()
 	case dialog.CompletionSelectedMsg:
 		existingValue := m.textarea.Value()
 		modifiedValue := strings.Replace(existingValue, msg.SearchString, msg.CompletionValue, 1)
@@ -162,7 +175,8 @@ func (m *editorCmp) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			return m, cmd
 		}
 		m.attachments = append(m.attachments, msg.Attachment)
-	case tea.KeyMsg:
+		m.syncTextareaSize()
+	case tea.KeyPressMsg:
 		if key.Matches(msg, DeleteKeyMaps.AttachmentDeleteMode) {
 			m.deleteMode = true
 			return m, nil
@@ -170,18 +184,23 @@ func (m *editorCmp) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		if key.Matches(msg, DeleteKeyMaps.DeleteAllAttachments) && m.deleteMode {
 			m.deleteMode = false
 			m.attachments = nil
+			m.syncTextareaSize()
 			return m, nil
 		}
-		if m.deleteMode && len(msg.Runes) > 0 && unicode.IsDigit(msg.Runes[0]) {
-			num := int(msg.Runes[0] - '0')
-			m.deleteMode = false
-			if num < 10 && len(m.attachments) > num {
-				if num == 0 {
-					m.attachments = m.attachments[num+1:]
-				} else {
-					m.attachments = slices.Delete(m.attachments, num, num+1)
+		if m.deleteMode && len(msg.Text) > 0 {
+			r := []rune(msg.Text)[0]
+			if unicode.IsDigit(r) {
+				num := int(r - '0')
+				m.deleteMode = false
+				if num < 10 && len(m.attachments) > num {
+					if num == 0 {
+						m.attachments = m.attachments[num+1:]
+					} else {
+						m.attachments = slices.Delete(m.attachments, num, num+1)
+					}
+					m.syncTextareaSize()
+					return m, nil
 				}
-				return m, nil
 			}
 		}
 		if key.Matches(msg, messageKeys.PageUp) || key.Matches(msg, messageKeys.PageDown) ||
@@ -189,7 +208,7 @@ func (m *editorCmp) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			return m, nil
 		}
 		if key.Matches(msg, editorMaps.OpenEditor) {
-			if m.app.CoderAgent.IsSessionBusy(m.session.ID) {
+			if m.isSessionBusy() {
 				return m, util.ReportWarn("Agent is working, please wait...")
 			}
 			return m, m.openEditor()
@@ -198,50 +217,135 @@ func (m *editorCmp) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.deleteMode = false
 			return m, nil
 		}
-		// Hanlde Enter key
+		// Handle Enter / Ctrl+S key
 		if m.textarea.Focused() && key.Matches(msg, editorMaps.Send) {
 			value := m.textarea.Value()
 			if len(value) > 0 && value[len(value)-1] == '\\' {
 				// If the last character is a backslash, remove it and add a newline
 				m.textarea.SetValue(value[:len(value)-1] + "\n")
 				return m, nil
-			} else {
-				// Otherwise, send the message
-				return m, m.send()
 			}
+			return m, m.send()
 		}
-
 	}
 	m.textarea, cmd = m.textarea.Update(msg)
 	return m, cmd
 }
 
-func (m *editorCmp) View() string {
+func (m *editorCmp) promptView() (string, int) {
 	t := theme.CurrentTheme()
-
-	// Style the prompt with theme colors
-	style := lipgloss.NewStyle().
+	prompt := styles.BaseStyle().
 		Padding(0, 0, 0, 1).
 		Bold(true).
-		Foreground(t.Primary())
+		Foreground(t.Primary()).
+		Render(">")
+	return prompt, lipgloss.Width(prompt)
+}
 
-	if len(m.attachments) == 0 {
-		return lipgloss.JoinHorizontal(lipgloss.Top, style.Render(">"), m.textarea.View())
+// Draw renders the optional attachments row, prompt, and textarea onto scr
+// within area, returning the translated hardware cursor when focused.
+func (m *editorCmp) Draw(scr uv.Screen, area uv.Rectangle) *tea.Cursor {
+	if area.Empty() {
+		return nil
 	}
-	m.textarea.SetHeight(m.height - 1)
-	return lipgloss.JoinVertical(lipgloss.Top,
-		m.attachmentsContent(),
-		lipgloss.JoinHorizontal(lipgloss.Top, style.Render(">"),
-			m.textarea.View()),
-	)
+
+	layout.ClearArea(scr, area)
+
+	prompt, promptWidth := m.promptView()
+	attachmentsOffset := 0
+	if len(m.attachments) > 0 && area.Dy() > 1 {
+		attachmentsOffset = 1
+		attachArea := image.Rect(area.Min.X, area.Min.Y, area.Max.X, area.Min.Y+1)
+		layout.DrawAt(scr, attachArea, m.attachmentsContent())
+	}
+
+	taWidth := max(1, area.Dx()-promptWidth)
+	taHeight := max(1, area.Dy()-attachmentsOffset)
+	if m.textarea.Width() != taWidth {
+		m.textarea.SetWidth(taWidth)
+	}
+	if m.textarea.Height() != taHeight {
+		m.textarea.SetHeight(taHeight)
+	}
+
+	promptMaxX := min(area.Max.X, area.Min.X+promptWidth)
+	promptArea := image.Rect(area.Min.X, area.Min.Y+attachmentsOffset, promptMaxX, area.Max.Y)
+	layout.DrawAt(scr, promptArea, prompt)
+
+	taArea := image.Rect(promptMaxX, area.Min.Y+attachmentsOffset, area.Max.X, area.Max.Y)
+	if !taArea.Empty() {
+		layout.DrawAt(scr, taArea, m.textarea.View())
+	}
+
+	if !m.textarea.Focused() {
+		return nil
+	}
+	cur := m.textarea.Cursor()
+	if cur == nil {
+		return nil
+	}
+	c := *cur
+	c.X += area.Min.X + promptWidth
+	c.Y += area.Min.Y + attachmentsOffset
+	c.X = util.Clamp(c.X, area.Min.X, area.Max.X-1)
+	c.Y = util.Clamp(c.Y, area.Min.Y, area.Max.Y-1)
+	return &c
+}
+
+func (m *editorCmp) View() tea.View {
+	if m.width <= 0 || m.height <= 0 {
+		prompt, promptWidth := m.promptView()
+		attachmentsOffset := 0
+		var content string
+		if len(m.attachments) == 0 {
+			content = lipgloss.JoinHorizontal(lipgloss.Top, prompt, m.textarea.View())
+		} else {
+			attachmentsOffset = 1
+			content = lipgloss.JoinVertical(
+				lipgloss.Left,
+				m.attachmentsContent(),
+				lipgloss.JoinHorizontal(lipgloss.Top, prompt, m.textarea.View()),
+			)
+		}
+		v := tea.NewView(content)
+		if m.textarea.Focused() {
+			if cur := m.textarea.Cursor(); cur != nil {
+				c := *cur
+				c.X += promptWidth
+				c.Y += attachmentsOffset
+				v.Cursor = &c
+			}
+		}
+		return v
+	}
+
+	buf := uv.NewScreenBuffer(m.width, m.height)
+	cur := m.Draw(buf, buf.Bounds())
+	v := tea.NewView(buf.Render())
+	v.Cursor = cur
+	return v
+}
+
+func (m *editorCmp) syncTextareaSize() {
+	if m.width <= 0 && m.height <= 0 {
+		return
+	}
+	attachmentsOffset := 0
+	if len(m.attachments) > 0 && m.height > 1 {
+		attachmentsOffset = 1
+	}
+	if m.width > 0 {
+		m.textarea.SetWidth(max(1, m.width-editorPromptWidth))
+	}
+	if m.height > 0 {
+		m.textarea.SetHeight(max(1, m.height-attachmentsOffset))
+	}
 }
 
 func (m *editorCmp) SetSize(width, height int) tea.Cmd {
 	m.width = width
 	m.height = height
-	m.textarea.SetWidth(width - 3) // account for the prompt and padding right
-	m.textarea.SetHeight(height)
-	m.textarea.SetWidth(width)
+	m.syncTextareaSize()
 	return nil
 }
 
@@ -268,8 +372,7 @@ func (m *editorCmp) attachmentsContent() string {
 		}
 		styledAttachments = append(styledAttachments, attachmentStyles.Render(filename))
 	}
-	content := lipgloss.JoinHorizontal(lipgloss.Left, styledAttachments...)
-	return content
+	return lipgloss.JoinHorizontal(lipgloss.Top, styledAttachments...)
 }
 
 func (m *editorCmp) BindingKeys() []key.Binding {
@@ -286,23 +389,34 @@ func CreateTextArea(existing *textarea.Model) textarea.Model {
 	textMutedColor := t.TextMuted()
 
 	ta := textarea.New()
-	ta.BlurredStyle.Base = styles.BaseStyle().Background(bgColor).Foreground(textColor)
-	ta.BlurredStyle.CursorLine = styles.BaseStyle().Background(bgColor)
-	ta.BlurredStyle.Placeholder = styles.BaseStyle().Background(bgColor).Foreground(textMutedColor)
-	ta.BlurredStyle.Text = styles.BaseStyle().Background(bgColor).Foreground(textColor)
-	ta.FocusedStyle.Base = styles.BaseStyle().Background(bgColor).Foreground(textColor)
-	ta.FocusedStyle.CursorLine = styles.BaseStyle().Background(bgColor)
-	ta.FocusedStyle.Placeholder = styles.BaseStyle().Background(bgColor).Foreground(textMutedColor)
-	ta.FocusedStyle.Text = styles.BaseStyle().Background(bgColor).Foreground(textColor)
+	taStyles := textarea.DefaultStyles(theme.HasDarkBackground())
+	taStyles.Blurred.Base = styles.BaseStyle().Background(bgColor).Foreground(textColor)
+	taStyles.Blurred.CursorLine = styles.BaseStyle().Background(bgColor)
+	taStyles.Blurred.Placeholder = styles.BaseStyle().Background(bgColor).Foreground(textMutedColor)
+	taStyles.Blurred.Text = styles.BaseStyle().Background(bgColor).Foreground(textColor)
+	taStyles.Blurred.Prompt = styles.BaseStyle().Background(bgColor).Foreground(textColor)
+	taStyles.Focused.Base = styles.BaseStyle().Background(bgColor).Foreground(textColor)
+	taStyles.Focused.CursorLine = styles.BaseStyle().Background(bgColor)
+	taStyles.Focused.Placeholder = styles.BaseStyle().Background(bgColor).Foreground(textMutedColor)
+	taStyles.Focused.Text = styles.BaseStyle().Background(bgColor).Foreground(textColor)
+	taStyles.Focused.Prompt = styles.BaseStyle().Background(bgColor).Foreground(textColor)
+	ta.SetStyles(taStyles)
 
 	ta.Prompt = " "
 	ta.ShowLineNumbers = false
 	ta.CharLimit = -1
+	ta.SetVirtualCursor(false)
 
 	if existing != nil {
 		ta.SetValue(existing.Value())
 		ta.SetWidth(existing.Width())
 		ta.SetHeight(existing.Height())
+		if existing.Focused() {
+			ta.Focus()
+		} else {
+			ta.Blur()
+		}
+		return ta
 	}
 
 	ta.Focus()

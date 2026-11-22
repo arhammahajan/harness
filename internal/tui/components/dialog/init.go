@@ -1,10 +1,12 @@
 package dialog
 
 import (
-	"github.com/charmbracelet/bubbles/key"
-	tea "github.com/charmbracelet/bubbletea"
-	"github.com/charmbracelet/lipgloss"
+	"charm.land/bubbles/v2/key"
+	tea "charm.land/bubbletea/v2"
+	"charm.land/lipgloss/v2"
+	uv "github.com/charmbracelet/ultraviolet"
 
+	"github.com/arhammahajan/harness/internal/tui/layout"
 	"github.com/arhammahajan/harness/internal/tui/styles"
 	"github.com/arhammahajan/harness/internal/tui/theme"
 	"github.com/arhammahajan/harness/internal/tui/util"
@@ -70,7 +72,7 @@ func (m InitDialogCmp) Init() tea.Cmd {
 // Update implements tea.Model.
 func (m InitDialogCmp) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	switch msg := msg.(type) {
-	case tea.KeyMsg:
+	case tea.KeyPressMsg:
 		switch {
 		case key.Matches(msg, key.NewBinding(key.WithKeys("esc"))):
 			return m, util.CmdHandler(CloseInitDialogMsg{Initialize: false})
@@ -91,13 +93,15 @@ func (m InitDialogCmp) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	return m, nil
 }
 
-// View implements tea.Model.
-func (m InitDialogCmp) View() string {
+func (m InitDialogCmp) render() string {
 	t := theme.CurrentTheme()
 	baseStyle := styles.BaseStyle()
-	
+
 	// Calculate width needed for content
 	maxWidth := 60 // Width for explanation text
+	if m.width > 0 {
+		maxWidth = max(20, min(maxWidth, m.width-10))
+	}
 
 	title := baseStyle.
 		Foreground(t.Primary()).
@@ -118,7 +122,6 @@ func (m InitDialogCmp) View() string {
 		Padding(1, 1).
 		Render("Would you like to initialize this project?")
 
-	maxWidth = min(maxWidth, m.width-10)
 	yesStyle := baseStyle
 	noStyle := baseStyle
 
@@ -163,8 +166,19 @@ func (m InitDialogCmp) View() string {
 		Border(lipgloss.RoundedBorder()).
 		BorderBackground(t.Background()).
 		BorderForeground(t.TextMuted()).
-		Width(lipgloss.Width(content) + 4).
+		Width(lipgloss.Width(content) + 6).
 		Render(content)
+}
+
+// View implements tea.Model.
+func (m InitDialogCmp) View() tea.View {
+	return tea.NewView(m.render())
+}
+
+// Draw implements layout.Drawable.
+func (m InitDialogCmp) Draw(scr uv.Screen, area uv.Rectangle) *tea.Cursor {
+	layout.DrawCenter(scr, area, m.render())
+	return nil
 }
 
 // SetSize sets the size of the component.
@@ -173,8 +187,13 @@ func (m *InitDialogCmp) SetSize(width, height int) {
 	m.height = height
 }
 
-// Bindings implements layout.Bindings.
+// Bindings returns key bindings for the dialog.
 func (m InitDialogCmp) Bindings() []key.Binding {
+	return m.keys.ShortHelp()
+}
+
+// BindingKeys implements layout.Bindings.
+func (m InitDialogCmp) BindingKeys() []key.Binding {
 	return m.keys.ShortHelp()
 }
 

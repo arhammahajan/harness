@@ -5,8 +5,9 @@ import (
 	"strings"
 	"time"
 
-	tea "github.com/charmbracelet/bubbletea"
-	"github.com/charmbracelet/lipgloss"
+	tea "charm.land/bubbletea/v2"
+	"charm.land/lipgloss/v2"
+	uv "github.com/charmbracelet/ultraviolet"
 	"github.com/arhammahajan/harness/internal/config"
 	"github.com/arhammahajan/harness/internal/llm/models"
 	"github.com/arhammahajan/harness/internal/lsp"
@@ -14,6 +15,8 @@ import (
 	"github.com/arhammahajan/harness/internal/pubsub"
 	"github.com/arhammahajan/harness/internal/session"
 	"github.com/arhammahajan/harness/internal/tui/components/chat"
+	"github.com/arhammahajan/harness/internal/tui/layout"
+	"github.com/arhammahajan/harness/internal/tui/render"
 	"github.com/arhammahajan/harness/internal/tui/styles"
 	"github.com/arhammahajan/harness/internal/tui/theme"
 	"github.com/arhammahajan/harness/internal/tui/util"
@@ -21,6 +24,7 @@ import (
 
 type StatusCmp interface {
 	tea.Model
+	layout.Drawable
 }
 
 type statusCmp struct {
@@ -29,20 +33,26 @@ type statusCmp struct {
 	messageTTL time.Duration
 	lspClients map[string]*lsp.Client
 	session    session.Session
+	drawCache  *render.DrawCache
 }
 
+var (
+	_ StatusCmp       = (*statusCmp)(nil)
+	_ layout.Drawable = (*statusCmp)(nil)
+)
+
 // clearMessageCmd is a command that clears status messages after a timeout
-func (m statusCmp) clearMessageCmd(ttl time.Duration) tea.Cmd {
+func (m *statusCmp) clearMessageCmd(ttl time.Duration) tea.Cmd {
 	return tea.Tick(ttl, func(time.Time) tea.Msg {
 		return util.ClearStatusMsg{}
 	})
 }
 
-func (m statusCmp) Init() tea.Cmd {
+func (m *statusCmp) Init() tea.Cmd {
 	return nil
 }
 
-func (m statusCmp) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
+func (m *statusCmp) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	switch msg := msg.(type) {
 	case tea.WindowSizeMsg:
 		m.width = msg.Width
@@ -69,8 +79,6 @@ func (m statusCmp) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	}
 	return m, nil
 }
-
-var helpWidget = ""
 
 // getHelpWidget returns the help widget with current theme colors
 func getHelpWidget() string {
@@ -107,22 +115,30 @@ func formatTokensAndCost(tokens, contextWindow int64, cost float64) string {
 	// Format cost with $ symbol and 2 decimal places
 	formattedCost := fmt.Sprintf("$%.2f", cost)
 
-	percentage := (float64(tokens) / float64(contextWindow)) * 100
-	if percentage > 80 {
-		// add the warning icon and percentage
-		formattedTokens = fmt.Sprintf("%s(%d%%)", styles.WarningIcon, int(percentage))
+	if contextWindow > 0 {
+		percentage := (float64(tokens) / float64(contextWindow)) * 100
+		if percentage > 80 {
+			// add the warning icon and percentage
+			formattedTokens = fmt.Sprintf("%s(%d%%)", styles.WarningIcon, int(percentage))
+		}
 	}
 
 	return fmt.Sprintf("Context: %s, Cost: %s", formattedTokens, formattedCost)
 }
 
-func (m statusCmp) View() string {
+func (m *statusCmp) renderView(width int) string {
 	t := theme.CurrentTheme()
-	modelID := config.Get().Agents[config.AgentCoder].Model
-	model := models.SupportedModels[modelID]
 
-	// Initialize the help widget
-	status := getHelpWidget()
+	var model models.Model
+	if cfg := config.Get(); cfg != nil {
+		if coder, ok := cfg.Agents[config.AgentCoder]; ok {
+			model = models.SupportedModels[coder.Model]
+		}
+	}
+
+	// Compute the help widget dynamically for the current theme
+	helpStr := getHelpWidget()
+	status := helpStr
 
 	tokenInfoWidth := 0
 	if m.session.ID != "" {
@@ -131,24 +147,29 @@ func (m statusCmp) View() string {
 		tokensStyle := styles.Padded().
 			Background(t.Text()).
 			Foreground(t.BackgroundSecondary())
-		percentage := (float64(totalTokens) / float64(model.ContextWindow)) * 100
-		if percentage > 80 {
-			tokensStyle = tokensStyle.Background(t.Warning())
+		if model.ContextWindow > 0 {
+			percentage := (float64(totalTokens) / float64(model.ContextWindow)) * 100
+			if percentage > 80 {
+				tokensStyle = tokensStyle.Background(t.Warning())
+			}
 		}
-		tokenInfoWidth = lipgloss.Width(tokens) + 2
-		status += tokensStyle.Render(tokens)
+		renderedTokens := tokensStyle.Render(tokens)
+		tokenInfoWidth = lipgloss.Width(renderedTokens)
+		status += renderedTokens
 	}
 
 	diagnostics := styles.Padded().
 		Background(t.BackgroundDarker()).
 		Render(m.projectDiagnostics())
 
-	availableWidht := max(0, m.width-lipgloss.Width(helpWidget)-lipgloss.Width(m.model())-lipgloss.Width(diagnostics)-tokenInfoWidth)
+	modelStr := m.model()
+
+	availableWidth := max(0, width-lipgloss.Width(helpStr)-lipgloss.Width(modelStr)-lipgloss.Width(diagnostics)-tokenInfoWidth)
 
 	if m.info.Msg != "" {
 		infoStyle := styles.Padded().
 			Foreground(t.Background()).
-			Width(availableWidht)
+			Width(availableWidth)
 
 		switch m.info.Type {
 		case util.InfoTypeInfo:
@@ -159,7 +180,7 @@ func (m statusCmp) View() string {
 			infoStyle = infoStyle.Background(t.Error())
 		}
 
-		infoWidth := availableWidht - 10
+		infoWidth := availableWidth - 10
 		// Truncate message if it's longer than available width
 		msg := m.info.Msg
 		if len(msg) > infoWidth && infoWidth > 0 {
@@ -170,13 +191,28 @@ func (m statusCmp) View() string {
 		status += styles.Padded().
 			Foreground(t.Text()).
 			Background(t.BackgroundSecondary()).
-			Width(availableWidht).
+			Width(availableWidth).
 			Render("")
 	}
 
 	status += diagnostics
-	status += m.model()
+	status += modelStr
 	return status
+}
+
+func (m *statusCmp) View() tea.View {
+	return tea.NewView(m.renderView(m.width))
+}
+
+func (m *statusCmp) Draw(scr uv.Screen, area uv.Rectangle) *tea.Cursor {
+	if area.Empty() {
+		return nil
+	}
+	if m.drawCache == nil {
+		m.drawCache = render.NewDrawCache()
+	}
+	m.drawCache.Draw(scr, area, m.renderView(area.Dx()))
+	return nil
 }
 
 func (m *statusCmp) projectDiagnostics() string {
@@ -185,6 +221,9 @@ func (m *statusCmp) projectDiagnostics() string {
 	// Check if any LSP server is still initializing
 	initializing := false
 	for _, client := range m.lspClients {
+		if client == nil {
+			continue
+		}
 		if client.GetServerState() == lsp.StateStarting {
 			initializing = true
 			break
@@ -204,6 +243,9 @@ func (m *statusCmp) projectDiagnostics() string {
 	hintDiagnostics := []protocol.Diagnostic{}
 	infoDiagnostics := []protocol.Diagnostic{}
 	for _, client := range m.lspClients {
+		if client == nil {
+			continue
+		}
 		for _, d := range client.GetDiagnostics() {
 			for _, diag := range d {
 				switch diag.Severity {
@@ -258,18 +300,13 @@ func (m *statusCmp) projectDiagnostics() string {
 	return strings.Join(diagnostics, " ")
 }
 
-func (m statusCmp) availableFooterMsgWidth(diagnostics, tokenInfo string) int {
-	tokensWidth := 0
-	if m.session.ID != "" {
-		tokensWidth = lipgloss.Width(tokenInfo) + 2
-	}
-	return max(0, m.width-lipgloss.Width(helpWidget)-lipgloss.Width(m.model())-lipgloss.Width(diagnostics)-tokensWidth)
-}
-
-func (m statusCmp) model() string {
+func (m *statusCmp) model() string {
 	t := theme.CurrentTheme()
 
 	cfg := config.Get()
+	if cfg == nil {
+		return "Unknown"
+	}
 
 	coder, ok := cfg.Agents[config.AgentCoder]
 	if !ok {
@@ -284,10 +321,9 @@ func (m statusCmp) model() string {
 }
 
 func NewStatusCmp(lspClients map[string]*lsp.Client) StatusCmp {
-	helpWidget = getHelpWidget()
-
 	return &statusCmp{
 		messageTTL: 10 * time.Second,
 		lspClients: lspClients,
+		drawCache:  render.NewDrawCache(),
 	}
 }
